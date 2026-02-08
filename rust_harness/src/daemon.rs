@@ -241,11 +241,13 @@ pub async fn daemon_main(relay: &str, state_dir: &Path, giftwrap_lookback_sec: u
 
     let mut rx = client.notifications();
 
-    // Subscribe to welcomes (giftwrap kind 1059).
+    // Subscribe to welcomes (GiftWrap kind 1059) addressed to us.
+    // NOTE: `pubkey()` filter matches the event author, not the recipient.
+    // GiftWraps can be authored by anyone, so we must filter by the recipient `p` tag.
     let since = Timestamp::now() - Duration::from_secs(giftwrap_lookback_sec);
     let gift_filter = Filter::new()
         .kind(Kind::GiftWrap)
-        .pubkey(keys.public_key())
+        .custom_tag(SingleLetterTag::lowercase(Alphabet::P), pubkey_hex.clone())
         .since(since)
         .limit(200);
     let gift_sub = client.subscribe(gift_filter, None).await?;
