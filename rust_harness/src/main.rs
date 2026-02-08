@@ -68,6 +68,11 @@ enum Command {
         /// Giftwrap lookback window (NIP-59 backdates timestamps; use hours/days, not seconds)
         #[arg(long, default_value_t = 60 * 60 * 24 * 3)]
         giftwrap_lookback_sec: u64,
+
+        /// Only accept welcomes and messages from these pubkeys (hex). Repeatable.
+        /// If empty, all pubkeys are allowed (open mode).
+        #[arg(long)]
+        allow_pubkey: Vec<String>,
     },
 }
 
@@ -220,7 +225,8 @@ async fn main() -> anyhow::Result<()> {
             relay,
             state_dir,
             giftwrap_lookback_sec,
-        } => daemon::daemon_main(&relay, &state_dir, giftwrap_lookback_sec)
+            allow_pubkey,
+        } => daemon::daemon_main(&relay, &state_dir, giftwrap_lookback_sec, &allow_pubkey)
             .await
             .context("daemon failed"),
     }

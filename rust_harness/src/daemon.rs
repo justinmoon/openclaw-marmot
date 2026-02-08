@@ -187,7 +187,7 @@ fn event_h_tag_hex(ev: &Event) -> Option<String> {
     None
 }
 
-pub async fn daemon_main(relay: &str, state_dir: &Path, giftwrap_lookback_sec: u64) -> anyhow::Result<()> {
+pub async fn daemon_main(relay: &str, state_dir: &Path, giftwrap_lookback_sec: u64, allow_pubkeys: &[String]) -> anyhow::Result<()> {
     crate::ensure_dir(state_dir).context("create state dir")?;
 
     crate::check_relay_ready(relay, Duration::from_secs(30))
@@ -207,6 +207,25 @@ pub async fn daemon_main(relay: &str, state_dir: &Path, giftwrap_lookback_sec: u
             eprintln!("[marmotd] stdout writer failed: {err:#}");
         }
     });
+
+    // Build pubkey allowlist. Empty = open (allow all).
+    let allowlist: HashSet<String> = allow_pubkeys
+        .iter()
+        .map(|pk| pk.trim().to_lowercase())
+        .filter(|pk| !pk.is_empty())
+        .collect();
+    let is_open = allowlist.is_empty();
+    if is_open {
+        eprintln!("[marmotd] WARNING: no --allow-pubkey specified, accepting all senders (open mode)");
+    } else {
+        eprintln!("[marmotd] allowlist: {} pubkeys", allowlist.len());
+        for pk in &allowlist {
+            eprintln!("[marmotd]   allow: {pk}");
+        }
+    }
+    let sender_allowed = |pubkey_hex: &str| -> bool {
+        is_open || allowlist.contains(&pubkey_hex.trim().to_lowercase())
+    };
 
     out_tx
         .send(OutMsg::Ready {
@@ -411,6 +430,9 @@ pub async fn daemon_main(relay: &str, state_dir: &Path, giftwrap_lookback_sec: u
                                                         continue;
                                                     }
                                                     if let Ok(MessageProcessingResult::ApplicationMessage(msg)) = mdk.process_message(ev) {
+                                                        if !sender_allowed(&msg.pubkey.to_hex()) {
+                                                            continue;
+                                                        }
                                                         out_tx.send(OutMsg::MessageReceived{
                                                             nostr_group_id: event_h_tag_hex(ev).unwrap_or_else(|| nostr_group_id_hex.clone()),
                                                             from_pubkey: msg.pubkey.to_hex().to_lowercase(),
@@ -557,6 +579,11 @@ pub async fn daemon_main(relay: &str, state_dir: &Path, giftwrap_lookback_sec: u
                     let mut rumor = unwrapped.rumor;
                     let from = unwrapped.sender;
 
+                    if !sender_allowed(&from.to_hex()) {
+                        warn!("[marmotd] reject welcome (sender not allowed) from={}", from.to_hex());
+                        continue;
+                    }
+
                     if let Err(e) = mdk.process_welcome(&wrapper_event_id, &rumor) {
                         warn!("[marmotd] process_welcome failed wrapper_id={} err={e:#}", wrapper_event_id.to_hex());
                         continue;
@@ -599,6 +626,10 @@ pub async fn daemon_main(relay: &str, state_dir: &Path, giftwrap_lookback_sec: u
                     let nostr_group_id = event_h_tag_hex(&event).unwrap_or_else(|| group_subs.get(&subscription_id).cloned().unwrap_or_default());
                     match mdk.process_message(&event) {
                         Ok(MessageProcessingResult::ApplicationMessage(msg)) => {
+                            if !sender_allowed(&msg.pubkey.to_hex()) {
+                                warn!("[marmotd] drop message (sender not allowed) from={}", msg.pubkey.to_hex());
+                                continue;
+                            }
                             out_tx.send(OutMsg::MessageReceived {
                                 nostr_group_id,
                                 from_pubkey: msg.pubkey.to_hex().to_lowercase(),
