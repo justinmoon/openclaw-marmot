@@ -42,6 +42,16 @@ function parseReplyExactly(text: string): string | null {
   return m ? m[1] ?? "" : null;
 }
 
+function parsePikaE2eNonce(text: string): string | null {
+  // Deterministic E2E test hook (no LLM):
+  //   inbound:  pika-e2e:<nonce>
+  //   reply:   pika-e2e-ack:<nonce>
+  //
+  // Keep this intentionally strict so it doesn't trigger accidentally in normal chats.
+  const m = text.match(/^pika-e2e:([a-zA-Z0-9._-]{8,128})\s*$/);
+  return m ? m[1] ?? "" : null;
+}
+
 function resolveSidecarCmd(cfgCmd?: string | null): string | null {
   const env = process.env.MARMOT_SIDECAR_CMD?.trim();
   if (env) return env;
@@ -249,6 +259,16 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
             ctx.log?.debug(
               `[${resolved.accountId}] drop message (sender not allowed) sender=${ev.from_pubkey}`,
             );
+            return;
+          }
+
+          const pikaE2eNonce = parsePikaE2eNonce(ev.content);
+          if (pikaE2eNonce !== null) {
+            const ack = `pika-e2e-ack:${pikaE2eNonce}`;
+            ctx.log?.info(
+              `[${resolved.accountId}] pika-e2e hook reply group=${ev.nostr_group_id} from=${ev.from_pubkey} nonce=${pikaE2eNonce}`,
+            );
+            await sidecar.sendMessage(ev.nostr_group_id, ack);
             return;
           }
 
