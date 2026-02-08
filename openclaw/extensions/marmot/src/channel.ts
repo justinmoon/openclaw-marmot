@@ -235,8 +235,10 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
             try {
               await sidecar.acceptWelcome(ev.wrapper_event_id);
             } catch (err) {
-              ctx.log?.debug(
-                `[${resolved.accountId}] failed to accept welcome (stale?): ${err}`,
+              // This is operationally important: without accepting, we won't subscribe to group
+              // traffic and the bot will appear "dead".
+              ctx.log?.error(
+                `[${resolved.accountId}] failed to accept welcome wrapper=${ev.wrapper_event_id}: ${err}`,
               );
             }
           }
