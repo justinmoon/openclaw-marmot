@@ -221,6 +221,12 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
           ctx.log?.info(
             `[${resolved.accountId}] welcome_received from=${ev.from_pubkey} group=${ev.nostr_group_id} name=${JSON.stringify(ev.group_name)}`,
           );
+          if (!isSenderAllowed(ev.from_pubkey)) {
+            ctx.log?.info(
+              `[${resolved.accountId}] reject welcome (sender not allowed) from=${ev.from_pubkey}`,
+            );
+            return;
+          }
           if (resolved.config.autoAcceptWelcomes) {
             try {
               await sidecar.acceptWelcome(ev.wrapper_event_id);
