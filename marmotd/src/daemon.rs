@@ -194,7 +194,7 @@ pub async fn daemon_main(
 ) -> anyhow::Result<()> {
     crate::ensure_dir(state_dir).context("create state dir")?;
 
-    crate::check_relay_ready(relay, Duration::from_secs(30))
+    crate::check_relay_ready(relay, Duration::from_secs(90))
         .await
         .with_context(|| format!("relay readiness check failed for {relay}"))?;
 

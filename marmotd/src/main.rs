@@ -258,7 +258,7 @@ async fn scenario_invite_and_chat_peer(
     let relay_url = RelayUrl::parse(relay).context("parse relay url")?;
     info!("[phase4] relay_url={relay}");
 
-    check_relay_ready(relay, Duration::from_secs(30))
+    check_relay_ready(relay, Duration::from_secs(90))
         .await
         .with_context(|| format!("relay readiness check failed for {relay}"))?;
     info!("[phase4] relay_ready=ok");
@@ -402,7 +402,7 @@ async fn scenario_invite_and_chat(
     let relay_url = RelayUrl::parse(relay).context("parse relay url")?;
     info!("[phase1] relay_url={relay}");
 
-    check_relay_ready(relay, Duration::from_secs(30))
+    check_relay_ready(relay, Duration::from_secs(90))
         .await
         .with_context(|| format!("relay readiness check failed for {relay}"))?;
     info!("[phase1] relay_ready=ok");
@@ -627,7 +627,7 @@ async fn scenario_invite_and_chat_rustbot(
     let relay_url = RelayUrl::parse(relay).context("parse relay url")?;
     info!("[phase2] relay_url={relay}");
 
-    check_relay_ready(relay, Duration::from_secs(30))
+    check_relay_ready(relay, Duration::from_secs(90))
         .await
         .with_context(|| format!("relay readiness check failed for {relay}"))?;
     info!("[phase2] relay_ready=ok");
@@ -791,7 +791,7 @@ async fn scenario_invite_and_chat_daemon(
     let relay_url = RelayUrl::parse(relay).context("parse relay url")?;
     info!("[phase3] relay_url={relay}");
 
-    check_relay_ready(relay, Duration::from_secs(30))
+    check_relay_ready(relay, Duration::from_secs(90))
         .await
         .with_context(|| format!("relay readiness check failed for {relay}"))?;
     info!("[phase3] relay_ready=ok");
@@ -1059,7 +1059,7 @@ async fn bot_main(
     ensure_dir(state_dir).context("create bot state dir")?;
 
     let relay_url = RelayUrl::parse(relay).context("parse relay url")?;
-    check_relay_ready(relay, Duration::from_secs(30))
+    check_relay_ready(relay, Duration::from_secs(90))
         .await
         .with_context(|| format!("relay readiness check failed for {relay}"))?;
 
