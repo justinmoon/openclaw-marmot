@@ -1,5 +1,3 @@
-import os from "node:os";
-import path from "node:path";
 import {
   DEFAULT_ACCOUNT_ID,
   formatPairingApproveHint,
@@ -13,6 +11,7 @@ import {
   type ResolvedMarmotAccount,
 } from "./types.js";
 import { MarmotSidecar, resolveAccountStateDir } from "./sidecar.js";
+import { resolveMarmotSidecarCommand } from "./sidecar-install.js";
 
 type MarmotSidecarHandle = {
   sidecar: MarmotSidecar;
@@ -21,6 +20,54 @@ type MarmotSidecarHandle = {
 };
 
 const activeSidecars = new Map<string, MarmotSidecarHandle>();
+
+async function dispatchInboundToAgent(params: {
+  runtime: ReturnType<typeof getMarmotRuntime>;
+  accountId: string;
+  chatId: string;
+  senderId: string;
+  text: string;
+  deliverText: (text: string) => Promise<void>;
+  log?: { error?: (msg: string) => void };
+}): Promise<void> {
+  const { runtime, accountId, chatId, senderId, text, deliverText } = params;
+  const cfg = runtime.config.loadConfig();
+
+  // Minimal MsgContext shape (kept intentionally simple; we rely on OpenClaw's
+  // finalizeInboundContext + dispatch plumbing to normalize/fill derived fields).
+  const ctx = {
+    Body: text,
+    RawBody: text,
+    CommandBody: text,
+    BodyForCommands: text,
+    From: senderId,
+    To: chatId,
+    SessionKey: `marmot:${accountId}:${chatId}`,
+    AccountId: accountId,
+    Provider: "marmot",
+    Surface: "marmot",
+    ChatType: "group",
+    SenderId: senderId,
+    CommandAuthorized: true,
+  } as any;
+
+  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx,
+    cfg,
+    dispatcherOptions: {
+      deliver: async (payload) => {
+        const replyText = payload.text?.trim();
+        if (!replyText) return;
+        await deliverText(replyText);
+      },
+      onError: (err, info) => {
+        params.log?.error?.(
+          `[${accountId}] reply dispatch error kind=${info.kind}: ${String(err)}`,
+        );
+      },
+    },
+  });
+}
 
 function looksLikeGroupIdHex(input: string): boolean {
   return /^[0-9a-f]{64}$/i.test(input.trim());
@@ -191,7 +238,11 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
         accountId: resolved.accountId,
         stateDirOverride: resolved.config.stateDir,
       });
-      const sidecarCmd = resolveSidecarCmd(resolved.config.sidecarCmd) ?? "rust_harness";
+      const requestedSidecarCmd = resolveSidecarCmd(resolved.config.sidecarCmd) ?? "marmotd";
+      const sidecarCmd = await resolveMarmotSidecarCommand({
+        requestedCmd: requestedSidecarCmd,
+        log: ctx.log,
+      });
       const sidecarArgs =
         resolveSidecarArgs(resolved.config.sidecarArgs) ??
         ["daemon", "--relay", relays[0] ?? "ws://127.0.0.1:18080", "--state-dir", baseStateDir];
@@ -287,20 +338,20 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
           }
 
           try {
-            await runtime.channel.reply.handleInboundMessage({
-              channel: "marmot",
+            await dispatchInboundToAgent({
+              runtime,
               accountId: resolved.accountId,
               senderId: ev.from_pubkey,
-              chatType: "group",
               chatId: ev.nostr_group_id,
               text: ev.content,
-              reply: async (responseText: string) => {
+              deliverText: async (responseText: string) => {
                 await sidecar.sendMessage(ev.nostr_group_id, responseText);
               },
+              log: ctx.log,
             });
           } catch (err) {
             ctx.log?.error(
-              `[${resolved.accountId}] handleInboundMessage failed: ${err}`,
+              `[${resolved.accountId}] dispatchInboundToAgent failed: ${err}`,
             );
           }
         }

@@ -16,7 +16,7 @@ use tracing::{Level, info, warn};
 mod daemon;
 
 #[derive(Debug, Parser)]
-#[command(name = "rust_harness")]
+#[command(name = "marmotd")]
 #[command(about = "Marmot interop lab harness (Rust track)")]
 struct Cli {
     #[command(subcommand)]
@@ -77,6 +77,7 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::enum_variant_names)]
 enum ScenarioCommand {
     /// Phase 1: Rust <-> Rust over a local relay (no OpenClaw)
     InviteAndChat {
@@ -1113,7 +1114,7 @@ async fn bot_main(
         return Err(anyhow!("expected bot to have 1 group, got {}", groups.len()));
     }
     let group = &groups[0];
-    let nostr_group_id_hex = hex::encode(group.nostr_group_id.clone());
+    let nostr_group_id_hex = hex::encode(group.nostr_group_id);
     let mls_group_id = group.mls_group_id.clone();
     println!("[openclaw_bot] joined_group nostr_group_id={nostr_group_id_hex}");
 
@@ -1658,11 +1659,9 @@ async fn check_relay_ready(relay_url: &str, timeout: Duration) -> anyhow::Result
             ));
         }
 
-        if let Ok(relay) = client.relay(relay_url.clone()).await {
-            if relay.is_connected() {
-                client.shutdown().await;
-                return Ok(());
-            }
+        if let Ok(relay) = client.relay(relay_url.clone()).await && relay.is_connected() {
+            client.shutdown().await;
+            return Ok(());
         }
 
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1752,16 +1751,15 @@ async fn spawn_rust_bot(
         let mut ready_tx = Some(ready_tx);
         while let Ok(Some(line)) = lines.next_line().await {
             info!("[phase2] bot_stdout={line}");
-            if ready_tx.is_some() && line.starts_with("[openclaw_bot] ready ") {
-                if let Some(hex) = line
+            if ready_tx.is_some()
+                && line.starts_with("[openclaw_bot] ready ")
+                && let Some(hex) = line
                     .split("pubkey=")
                     .nth(1)
                     .and_then(|rest| rest.split_whitespace().next())
-                {
-                    if let Ok(pk) = PublicKey::from_hex(hex) {
-                        let _ = ready_tx.take().unwrap().send(pk);
-                    }
-                }
+                && let Ok(pk) = PublicKey::from_hex(hex)
+            {
+                let _ = ready_tx.take().unwrap().send(pk);
             }
         }
     });

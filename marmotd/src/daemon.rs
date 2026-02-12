@@ -176,12 +176,8 @@ fn parse_relay_list(relay: &str, relays_override: &[String]) -> anyhow::Result<V
 
 fn event_h_tag_hex(ev: &Event) -> Option<String> {
     for t in ev.tags.iter() {
-        if t.kind() == TagKind::h() {
-            if let Some(v) = t.content() {
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
+        if t.kind() == TagKind::h() && let Some(v) = t.content() && !v.is_empty() {
+            return Some(v.to_string());
         }
     }
     None

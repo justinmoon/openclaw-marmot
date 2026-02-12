@@ -35,4 +35,4 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo run -p rust_harness -- scenario invite-and-chat --relay "${RELAY_URL}" --state-dir "${STATE_DIR}"
+cargo run -p marmotd -- scenario invite-and-chat --relay "${RELAY_URL}" --state-dir "${STATE_DIR}"

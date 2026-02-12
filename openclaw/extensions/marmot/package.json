@@ -1,13 +1,13 @@
 {
-  "name": "@openclaw/marmot",
+  "name": "@justinmoon/openclaw-marmot",
   "version": "0.0.0",
   "description": "OpenClaw Marmot channel plugin (Rust sidecar)",
   "type": "module",
-  "dependencies": {
-    "openclaw": "workspace:*"
+  "publishConfig": {
+    "access": "public"
   },
-  "devDependencies": {
-    "openclaw": "workspace:*"
+  "peerDependencies": {
+    "openclaw": ">=2026.1.0"
   },
   "openclaw": {
     "extensions": [
@@ -24,7 +24,7 @@
       "quickstartAllowFrom": true
     },
     "install": {
-      "npmSpec": "@openclaw/marmot",
+      "npmSpec": "@justinmoon/openclaw-marmot",
       "localPath": "extensions/marmot",
       "defaultChoice": "path"
     }

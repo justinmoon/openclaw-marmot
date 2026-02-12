@@ -9,6 +9,9 @@ STATE_DIR="${STATE_DIR:-.state}"
 RELAY_URL="${RELAY_URL:-}"
 
 OPENCLAW_DIR="${OPENCLAW_DIR:-openclaw}"
+if [[ ! -f "${OPENCLAW_DIR}/package.json" && -f "../openclaw/package.json" ]]; then
+  OPENCLAW_DIR="../openclaw"
+fi
 
 rm -rf "${STATE_DIR}/openclaw-marmot"
 mkdir -p "${STATE_DIR}/relay/nostr-rs-relay-db"
@@ -44,8 +47,8 @@ cleanup() {
 trap cleanup EXIT
 
 # Build Rust sidecar.
-cargo build -p rust_harness
-SIDECAR_CMD="$(pwd)/target/debug/rust_harness"
+cargo build -p marmotd
+SIDECAR_CMD="$(pwd)/target/debug/marmotd"
 
 # Ensure OpenClaw deps exist.
 pnpm_cmd=(pnpm)
@@ -69,6 +72,7 @@ GW_TOKEN="e2e-$(date +%s)-$$"
 OPENCLAW_STATE_DIR="$(pwd)/${STATE_DIR}/openclaw-marmot/state"
 OPENCLAW_CONFIG_PATH="$(pwd)/${STATE_DIR}/openclaw-marmot/openclaw.json"
 MARMOT_SIDECAR_STATE_DIR="$(pwd)/${STATE_DIR}/openclaw-marmot/marmotd/default"
+MARMOT_PLUGIN_PATH="$(pwd)/openclaw/extensions/marmot"
 
 mkdir -p "${OPENCLAW_STATE_DIR}"
 mkdir -p "${MARMOT_SIDECAR_STATE_DIR}"
@@ -78,9 +82,20 @@ cat > "${OPENCLAW_CONFIG_PATH}" <<JSON
   "plugins": {
     "enabled": true,
     "allow": ["marmot"],
+    "load": { "paths": ["${MARMOT_PLUGIN_PATH}"] },
     "slots": { "memory": "none" },
     "entries": {
-      "marmot": { "enabled": true }
+      "marmot": {
+        "enabled": true,
+        "config": {
+          "relays": ["${RELAY_URL}"],
+          "groupPolicy": "open",
+          "autoAcceptWelcomes": true,
+          "stateDir": "${MARMOT_SIDECAR_STATE_DIR}",
+          "sidecarCmd": "${SIDECAR_CMD}",
+          "sidecarArgs": ["daemon", "--relay", "${RELAY_URL}", "--state-dir", "${MARMOT_SIDECAR_STATE_DIR}"]
+        }
+      }
     }
   },
   "channels": {
@@ -140,7 +155,7 @@ with open("${IDENTITY_PATH}", "r", encoding="utf-8") as f:
 PY
 )"
 
-cargo run -p rust_harness -- scenario invite-and-chat-peer \
+cargo run -p marmotd -- scenario invite-and-chat-peer \
   --relay "${RELAY_URL}" \
   --state-dir "${STATE_DIR}" \
   --peer-pubkey "${PEER_PUBKEY}"
