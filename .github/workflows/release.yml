@@ -4,38 +4,36 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             asset_name: marmotd-x86_64-linux
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             asset_name: marmotd-aarch64-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
-      - name: Set up Zig
-        uses: goto-bus-stop/setup-zig@v2
-
-      - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild --locked
+      - name: Add target
+        run: rustup target add "${{ matrix.target }}"
 
       - name: Build binary
-        run: cargo zigbuild -p marmotd --release --target "${{ matrix.target }}"
+        run: cargo build -p marmotd --release --target "${{ matrix.target }}"
 
       - name: Stage artifact
         run: |
@@ -55,21 +53,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
-            target: x86_64-apple-darwin
+          - target: x86_64-apple-darwin
             asset_name: marmotd-x86_64-darwin
-          - runner: macos-14
-            target: aarch64-apple-darwin
+          - target: aarch64-apple-darwin
             asset_name: marmotd-aarch64-darwin
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-14
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+
+      - name: Add target
+        run: rustup target add "${{ matrix.target }}"
 
       - name: Build binary
         run: cargo build -p marmotd --release --target "${{ matrix.target }}"

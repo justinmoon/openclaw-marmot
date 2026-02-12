@@ -1,5 +1,8 @@
 # marmot-interop-lab-rust
 
+> [!WARNING]
+> Alpha software. This project was largely vibe-coded and likely contains privacy and security flaws. Do not use it for sensitive or production workloads.
+
 Phased plan for a Rust-based Marmot interop harness.
 
 ## OpenClaw Setup Guide

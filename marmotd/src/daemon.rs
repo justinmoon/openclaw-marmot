@@ -176,17 +176,25 @@ fn parse_relay_list(relay: &str, relays_override: &[String]) -> anyhow::Result<V
 
 fn event_h_tag_hex(ev: &Event) -> Option<String> {
     for t in ev.tags.iter() {
-        if t.kind() == TagKind::h() && let Some(v) = t.content() && !v.is_empty() {
+        if t.kind() == TagKind::h()
+            && let Some(v) = t.content()
+            && !v.is_empty()
+        {
             return Some(v.to_string());
         }
     }
     None
 }
 
-pub async fn daemon_main(relay: &str, state_dir: &Path, giftwrap_lookback_sec: u64, allow_pubkeys: &[String]) -> anyhow::Result<()> {
+pub async fn daemon_main(
+    relay: &str,
+    state_dir: &Path,
+    giftwrap_lookback_sec: u64,
+    allow_pubkeys: &[String],
+) -> anyhow::Result<()> {
     crate::ensure_dir(state_dir).context("create state dir")?;
 
-    crate::check_relay_ready(relay, Duration::from_secs(30))
+    crate::check_relay_ready(relay, Duration::from_secs(90))
         .await
         .with_context(|| format!("relay readiness check failed for {relay}"))?;
 
@@ -212,7 +220,9 @@ pub async fn daemon_main(relay: &str, state_dir: &Path, giftwrap_lookback_sec: u
         .collect();
     let is_open = allowlist.is_empty();
     if is_open {
-        eprintln!("[marmotd] WARNING: no --allow-pubkey specified, accepting all senders (open mode)");
+        eprintln!(
+            "[marmotd] WARNING: no --allow-pubkey specified, accepting all senders (open mode)"
+        );
     } else {
         eprintln!("[marmotd] allowlist: {} pubkeys", allowlist.len());
         for pk in &allowlist {
@@ -264,7 +274,9 @@ pub async fn daemon_main(relay: &str, state_dir: &Path, giftwrap_lookback_sec: u
                     group_subs.insert(sid.clone(), nostr_group_id_hex.clone());
                 }
                 Err(err) => {
-                    warn!("[marmotd] subscribe existing group failed nostr_group_id={nostr_group_id_hex} err={err:#}");
+                    warn!(
+                        "[marmotd] subscribe existing group failed nostr_group_id={nostr_group_id_hex} err={err:#}"
+                    );
                 }
             }
         }

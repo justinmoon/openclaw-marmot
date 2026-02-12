@@ -194,18 +194,29 @@ async fn main() -> anyhow::Result<()> {
                 state_dir,
                 timeout_sec,
                 giftwrap_lookback_sec,
-            } => scenario_invite_and_chat_daemon(&relay, &state_dir, timeout_sec, giftwrap_lookback_sec)
-                .await
-                .context("scenario invite-and-chat-daemon failed"),
+            } => scenario_invite_and_chat_daemon(
+                &relay,
+                &state_dir,
+                timeout_sec,
+                giftwrap_lookback_sec,
+            )
+            .await
+            .context("scenario invite-and-chat-daemon failed"),
             ScenarioCommand::InviteAndChatPeer {
                 relay,
                 state_dir,
                 peer_pubkey,
                 timeout_sec,
                 giftwrap_lookback_sec,
-            } => scenario_invite_and_chat_peer(&relay, &state_dir, &peer_pubkey, timeout_sec, giftwrap_lookback_sec)
-                .await
-                .context("scenario invite-and-chat-peer failed"),
+            } => scenario_invite_and_chat_peer(
+                &relay,
+                &state_dir,
+                &peer_pubkey,
+                timeout_sec,
+                giftwrap_lookback_sec,
+            )
+            .await
+            .context("scenario invite-and-chat-peer failed"),
         },
         Command::Bot {
             relay,
@@ -247,7 +258,7 @@ async fn scenario_invite_and_chat_peer(
     let relay_url = RelayUrl::parse(relay).context("parse relay url")?;
     info!("[phase4] relay_url={relay}");
 
-    check_relay_ready(relay, Duration::from_secs(30))
+    check_relay_ready(relay, Duration::from_secs(90))
         .await
         .with_context(|| format!("relay readiness check failed for {relay}"))?;
     info!("[phase4] relay_ready=ok");
@@ -391,7 +402,7 @@ async fn scenario_invite_and_chat(
     let relay_url = RelayUrl::parse(relay).context("parse relay url")?;
     info!("[phase1] relay_url={relay}");
 
-    check_relay_ready(relay, Duration::from_secs(30))
+    check_relay_ready(relay, Duration::from_secs(90))
         .await
         .with_context(|| format!("relay readiness check failed for {relay}"))?;
     info!("[phase1] relay_ready=ok");
@@ -616,7 +627,7 @@ async fn scenario_invite_and_chat_rustbot(
     let relay_url = RelayUrl::parse(relay).context("parse relay url")?;
     info!("[phase2] relay_url={relay}");
 
-    check_relay_ready(relay, Duration::from_secs(30))
+    check_relay_ready(relay, Duration::from_secs(90))
         .await
         .with_context(|| format!("relay readiness check failed for {relay}"))?;
     info!("[phase2] relay_ready=ok");
@@ -780,7 +791,7 @@ async fn scenario_invite_and_chat_daemon(
     let relay_url = RelayUrl::parse(relay).context("parse relay url")?;
     info!("[phase3] relay_url={relay}");
 
-    check_relay_ready(relay, Duration::from_secs(30))
+    check_relay_ready(relay, Duration::from_secs(90))
         .await
         .with_context(|| format!("relay readiness check failed for {relay}"))?;
     info!("[phase3] relay_ready=ok");
@@ -807,7 +818,10 @@ async fn scenario_invite_and_chat_daemon(
         .kill_on_drop(true);
 
     let mut child = cmd.spawn().context("spawn daemon")?;
-    let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("daemon stdin not captured"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("daemon stdin not captured"))?;
     let stdout = child
         .stdout
         .take()
@@ -834,7 +848,9 @@ async fn scenario_invite_and_chat_daemon(
             .await
             .context("timeout waiting for daemon ready")?
             .context("daemon stdout closed")?;
-        let Some(line) = line else { break; };
+        let Some(line) = line else {
+            break;
+        };
         let v: serde_json::Value =
             serde_json::from_str(&line).with_context(|| format!("decode daemon json: {line}"))?;
         if v.get("type").and_then(|t| t.as_str()) == Some("ready") {
@@ -852,7 +868,10 @@ async fn scenario_invite_and_chat_daemon(
         daemon_pubkey.to_hex().to_lowercase()
     );
 
-    async fn daemon_send(stdin: &mut tokio::process::ChildStdin, v: serde_json::Value) -> anyhow::Result<()> {
+    async fn daemon_send(
+        stdin: &mut tokio::process::ChildStdin,
+        v: serde_json::Value,
+    ) -> anyhow::Result<()> {
         let s = serde_json::to_string(&v).context("encode daemon cmd")?;
         stdin.write_all(s.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
@@ -882,8 +901,8 @@ async fn scenario_invite_and_chat_daemon(
             let Some(line) = line else {
                 return Err(anyhow!("daemon stdout closed"));
             };
-            let v: serde_json::Value =
-                serde_json::from_str(&line).with_context(|| format!("decode daemon json: {line}"))?;
+            let v: serde_json::Value = serde_json::from_str(&line)
+                .with_context(|| format!("decode daemon json: {line}"))?;
             if pred(&v) {
                 return Ok(v);
             }
@@ -982,7 +1001,8 @@ async fn scenario_invite_and_chat_daemon(
     // When daemon reports it received the prompt, command it to send the reply.
     let _ = daemon_wait_for(&mut out_lines, Duration::from_secs(timeout_sec), |v| {
         v.get("type").and_then(|t| t.as_str()) == Some("message_received")
-            && v.get("from_pubkey").and_then(|p| p.as_str()) == Some(&a_keys.public_key().to_hex().to_lowercase())
+            && v.get("from_pubkey").and_then(|p| p.as_str())
+                == Some(&a_keys.public_key().to_hex().to_lowercase())
             && v.get("content").and_then(|c| c.as_str()) == Some(&prompt)
     })
     .await?;
@@ -1016,7 +1036,11 @@ async fn scenario_invite_and_chat_daemon(
     );
 
     // Shutdown daemon.
-    let _ = daemon_send(&mut stdin, serde_json::json!({"cmd":"shutdown","request_id":"bye"})).await;
+    let _ = daemon_send(
+        &mut stdin,
+        serde_json::json!({"cmd":"shutdown","request_id":"bye"}),
+    )
+    .await;
     let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
 
     a_client.unsubscribe_all().await;
@@ -1035,7 +1059,7 @@ async fn bot_main(
     ensure_dir(state_dir).context("create bot state dir")?;
 
     let relay_url = RelayUrl::parse(relay).context("parse relay url")?;
-    check_relay_ready(relay, Duration::from_secs(30))
+    check_relay_ready(relay, Duration::from_secs(90))
         .await
         .with_context(|| format!("relay readiness check failed for {relay}"))?;
 
@@ -1111,7 +1135,10 @@ async fn bot_main(
 
     let groups = mdk.get_groups().context("get_groups")?;
     if groups.len() != 1 {
-        return Err(anyhow!("expected bot to have 1 group, got {}", groups.len()));
+        return Err(anyhow!(
+            "expected bot to have 1 group, got {}",
+            groups.len()
+        ));
     }
     let group = &groups[0];
     let nostr_group_id_hex = hex::encode(group.nostr_group_id);
@@ -1644,26 +1671,52 @@ async fn wait_for_exact_application(
 
 async fn check_relay_ready(relay_url: &str, timeout: Duration) -> anyhow::Result<()> {
     let relay_url = RelayUrl::parse(relay_url).context("parse relay url")?;
-
-    // Use nostr-sdk for a real WS connect/close loop with the proper Nostr websocket subprotocol.
-    let client = Client::new(Keys::generate());
-    client.add_relay(relay_url.clone()).await?;
-    client.connect().await;
-
     let deadline = Instant::now() + timeout;
+    let mut attempt: usize = 0;
+    let mut last_detail = String::new();
+
     loop {
         if Instant::now() >= deadline {
-            client.shutdown().await;
             return Err(anyhow!(
-                "timeout waiting for relay websocket to become connected"
+                "timeout waiting for relay websocket to become connected (attempts={attempt}, last={last_detail})"
             ));
         }
 
-        if let Ok(relay) = client.relay(relay_url.clone()).await && relay.is_connected() {
+        attempt += 1;
+
+        // Build a fresh nostr-sdk client each attempt. In CI we can hit a transient startup race
+        // where the relay process is up but not yet ready for websocket handshakes; a single early
+        // connect attempt may never transition to connected within the overall timeout.
+        let client = Client::new(Keys::generate());
+        match client.add_relay(relay_url.clone()).await {
+            Ok(_) => {}
+            Err(err) => {
+                last_detail = format!("add_relay: {err}");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+        }
+
+        client.connect().await;
+        let connect_deadline = Instant::now() + Duration::from_secs(3);
+        let mut connected = false;
+        while Instant::now() < connect_deadline {
+            if let Ok(relay) = client.relay(relay_url.clone()).await
+                && relay.is_connected()
+            {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        if connected {
             client.shutdown().await;
             return Ok(());
         }
 
+        last_detail = "not connected yet".to_string();
+        client.shutdown().await;
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
