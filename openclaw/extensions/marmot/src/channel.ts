@@ -147,7 +147,7 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
     media: false,
     nativeCommands: false,
   },
-  reload: { configPrefixes: ["channels.marmot", "plugins.entries.marmot"] },
+  reload: { configPrefixes: ["channels.marmot", "plugins.entries.openclaw-marmot"] },
 
   config: {
     listAccountIds: (cfg) => listMarmotAccountIds(cfg),
