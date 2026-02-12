@@ -9,22 +9,24 @@ Phased plan for a Rust-based Marmot interop harness.
 
 Use Marmot as an [OpenClaw](https://openclaw.dev) channel plugin so your AI agent can send and receive messages over Nostr MLS groups.
 
+**No Rust toolchain required.** The plugin automatically downloads a prebuilt `marmotd` binary for your platform from GitHub releases.
+
 ### Prerequisites
 
 - **OpenClaw** installed and running (`openclaw onboard`)
-- **Rust toolchain** (to build `marmotd`)
-- **A Nostr keypair** in hex format (secret key + public key)
+- **A Nostr keypair** in hex format (optional — a random identity is generated if you skip this)
 
-### 1. Clone and build marmotd
+### 1. Install the plugin
 
 ```bash
-git clone https://github.com/justinmoon/openclaw-marmot
-cd openclaw-marmot/marmotd
-cargo build --release
-# binary at target/release/marmotd
+openclaw plugins install @justinmoon/openclaw-marmot
 ```
 
-### 2. Create a state directory and identity file
+This installs the plugin via npm. The `marmotd` sidecar binary is auto-downloaded on first launch (Linux and macOS, x64 and arm64).
+
+### 2. (Optional) Set up an identity
+
+If you want a specific Nostr identity, create a state directory and identity file:
 
 ```bash
 mkdir -p ~/.openclaw/.marmot-state
@@ -47,21 +49,16 @@ chmod 600 ~/.openclaw/.marmot-state/identity.json
 
 If you skip this step entirely, `marmotd` will generate a random identity on first run.
 
-### 3. Configure OpenClaw
+### 3. Configure the channel
 
-Add the plugin path and channel config to `~/.openclaw/openclaw.json`:
+Add the channel config to `~/.openclaw/openclaw.json`:
 
 ```json
 {
-  "plugins": {
-    "load": {
-      "paths": ["<path-to>/openclaw-marmot/openclaw/extensions/marmot"]
-    }
-  },
   "channels": {
     "marmot": {
       "relays": ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"],
-      "sidecarCmd": "<path-to>/openclaw-marmot/marmotd/target/release/marmotd",
+      "sidecarCmd": "marmotd",
       "stateDir": "~/.openclaw/.marmot-state",
       "autoAcceptWelcomes": true,
       "groupPolicy": "open",
@@ -71,7 +68,9 @@ Add the plugin path and channel config to `~/.openclaw/openclaw.json`:
 }
 ```
 
-Replace `<path-to>` with the absolute path to your clone and `<hex-pubkey-of-allowed-sender>` with the Nostr public key(s) you want to accept messages from.
+Replace `<hex-pubkey-of-allowed-sender>` with the Nostr public key(s) you want to accept messages from.
+
+> **Note:** Setting `sidecarCmd` to just `"marmotd"` (no path) tells the plugin to auto-download the correct prebuilt binary. Binaries are cached at `~/.openclaw/tools/marmot/<version>/marmotd`.
 
 ### 4. Restart OpenClaw gateway
 
@@ -97,7 +96,23 @@ Use [Pika](https://pika.team) or another Marmot-compatible client to create a gr
 - **Relay loading** — the sidecar starts with only the first relay; the rest are added via `setRelays` after startup.
 - **`groupPolicy: "allowlist"`** requires explicit group IDs in the `groups` config. Use `"open"` with `groupAllowFrom` if you just want sender-level filtering.
 - **Duplicate sidecars** — multiple rapid gateway restarts can spawn duplicate sidecar processes fighting over the SQLite state. Kill extras manually if this happens.
-- **Plugin ID warning** — the plugin manifest uses id `"marmot"` but the config entry hints `"openclaw-marmot"`. This warning is harmless.
+
+### Building from source
+
+If you prefer to compile `marmotd` yourself (requires the Rust toolchain):
+
+```bash
+git clone https://github.com/justinmoon/openclaw-marmot
+cd openclaw-marmot/marmotd
+cargo build --release
+# binary at target/release/marmotd
+```
+
+Then set `sidecarCmd` in your channel config to the absolute path of the binary:
+
+```json
+"sidecarCmd": "/path/to/openclaw-marmot/marmotd/target/release/marmotd"
+```
 
 ---
 
