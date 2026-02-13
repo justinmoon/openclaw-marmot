@@ -207,6 +207,26 @@ fn shared_call_relay(params: &CallSessionParams) -> InMemoryRelay {
     relays.entry(relay_key(params)).or_default().clone()
 }
 
+fn default_audio_call_session(call_id: &str) -> CallSessionParams {
+    CallSessionParams {
+        moq_url: "https://moq.local/anon".to_string(),
+        broadcast_base: format!("pika/calls/{call_id}"),
+        tracks: vec![CallTrackSpec {
+            name: "audio0".to_string(),
+            codec: "opus".to_string(),
+            sample_rate: 48_000,
+            channels: 1,
+            frame_ms: 20,
+        }],
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioEchoSmokeStats {
+    pub sent_frames: u64,
+    pub echoed_frames: u64,
+}
+
 fn out_error(request_id: Option<String>, code: &str, message: impl Into<String>) -> OutMsg {
     OutMsg::Error {
         request_id,
@@ -413,6 +433,24 @@ fn start_echo_worker(
     out_tx: mpsc::UnboundedSender<OutMsg>,
 ) -> anyhow::Result<EchoWorker> {
     let relay = shared_call_relay(session);
+    start_echo_worker_with_relay(
+        call_id,
+        session,
+        relay,
+        local_pubkey_hex,
+        peer_pubkey_hex,
+        out_tx,
+    )
+}
+
+fn start_echo_worker_with_relay(
+    call_id: &str,
+    session: &CallSessionParams,
+    relay: InMemoryRelay,
+    local_pubkey_hex: &str,
+    peer_pubkey_hex: &str,
+    out_tx: mpsc::UnboundedSender<OutMsg>,
+) -> anyhow::Result<EchoWorker> {
     let mut media = MediaSession::with_relay(
         SessionConfig {
             moq_url: session.moq_url.clone(),
@@ -475,6 +513,94 @@ fn start_echo_worker(
     });
 
     Ok(EchoWorker { stop, task })
+}
+
+pub async fn run_audio_echo_smoke(frame_count: u64) -> anyhow::Result<AudioEchoSmokeStats> {
+    let call_id = "550e8400-e29b-41d4-a716-446655440000";
+    let session = default_audio_call_session(call_id);
+    let relay = InMemoryRelay::new();
+
+    let mut peer = MediaSession::with_relay(
+        SessionConfig {
+            moq_url: session.moq_url.clone(),
+        },
+        relay.clone(),
+    );
+    let mut observer = MediaSession::with_relay(
+        SessionConfig {
+            moq_url: session.moq_url.clone(),
+        },
+        relay.clone(),
+    );
+    peer.connect();
+    observer.connect();
+
+    let peer_pubkey_hex = "11b9a894813efe60d39f8621ae9dc4c6d26de4732411c1cdf4bb15e88898a19c";
+    let bot_pubkey_hex = "2284fc7b932b5dbbdaa2185c76a4e17a2ef928d4a82e29b812986b454b957f8f";
+    let peer_track = TrackAddress {
+        broadcast_path: broadcast_path(&session.broadcast_base, peer_pubkey_hex)
+            .map_err(|e| anyhow!("peer broadcast path invalid: {e}"))?,
+        track_name: "audio0".to_string(),
+    };
+    let bot_track = TrackAddress {
+        broadcast_path: broadcast_path(&session.broadcast_base, bot_pubkey_hex)
+            .map_err(|e| anyhow!("bot broadcast path invalid: {e}"))?,
+        track_name: "audio0".to_string(),
+    };
+    let echoed_rx = observer
+        .subscribe(&bot_track)
+        .context("subscribe bot audio track")?;
+
+    let (out_tx, _out_rx) = mpsc::unbounded_channel::<OutMsg>();
+    let worker = start_echo_worker_with_relay(
+        call_id,
+        &session,
+        relay,
+        bot_pubkey_hex,
+        peer_pubkey_hex,
+        out_tx,
+    )
+    .context("start echo worker")?;
+
+    let codec = OpusCodec;
+    let mut sent_frames = 0u64;
+    for i in 0..frame_count {
+        let pcm = vec![i as i16, (i as i16).saturating_mul(-1)];
+        let packet = codec.encode_pcm_i16(&pcm);
+        let frame = MediaFrame {
+            seq: i,
+            timestamp_us: i * 20_000,
+            keyframe: true,
+            payload: packet.0,
+        };
+        let delivered = peer
+            .publish(&peer_track, frame)
+            .context("publish peer frame")?;
+        if delivered > 0 {
+            sent_frames = sent_frames.saturating_add(1);
+        }
+    }
+
+    let mut echoed_frames = 0u64;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while echoed_frames < sent_frames && tokio::time::Instant::now() < deadline {
+        while echoed_rx.try_recv().is_ok() {
+            echoed_frames = echoed_frames.saturating_add(1);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    worker.stop().await;
+
+    if echoed_frames != sent_frames {
+        return Err(anyhow!(
+            "audio echo frame mismatch: sent={sent_frames} echoed={echoed_frames}"
+        ));
+    }
+
+    Ok(AudioEchoSmokeStats {
+        sent_frames,
+        echoed_frames,
+    })
 }
 
 async fn publish_and_confirm_multi(
@@ -1233,20 +1359,6 @@ pub async fn daemon_main(
 mod tests {
     use super::*;
 
-    fn sample_session() -> CallSessionParams {
-        CallSessionParams {
-            moq_url: "https://moq.local/anon".to_string(),
-            broadcast_base: "pika/calls/550e8400-e29b-41d4-a716-446655440000".to_string(),
-            tracks: vec![CallTrackSpec {
-                name: "audio0".to_string(),
-                codec: "opus".to_string(),
-                sample_rate: 48_000,
-                channels: 1,
-                frame_ms: 20,
-            }],
-        }
-    }
-
     #[test]
     fn parses_call_invite_signal() {
         let content = serde_json::json!({
@@ -1284,73 +1396,8 @@ mod tests {
 
     #[tokio::test]
     async fn echo_worker_republishes_frames() {
-        let session = sample_session();
-        let relay = shared_call_relay(&session);
-        let mut peer = MediaSession::with_relay(
-            SessionConfig {
-                moq_url: session.moq_url.clone(),
-            },
-            relay.clone(),
-        );
-        let mut observer = MediaSession::with_relay(
-            SessionConfig {
-                moq_url: session.moq_url.clone(),
-            },
-            relay,
-        );
-        peer.connect();
-        observer.connect();
-
-        let peer_pubkey_hex = "11b9a894813efe60d39f8621ae9dc4c6d26de4732411c1cdf4bb15e88898a19c";
-        let bot_pubkey_hex = "2284fc7b932b5dbbdaa2185c76a4e17a2ef928d4a82e29b812986b454b957f8f";
-        let peer_track = TrackAddress {
-            broadcast_path: broadcast_path(&session.broadcast_base, peer_pubkey_hex)
-                .expect("peer track"),
-            track_name: "audio0".to_string(),
-        };
-        let bot_track = TrackAddress {
-            broadcast_path: broadcast_path(&session.broadcast_base, bot_pubkey_hex)
-                .expect("bot track"),
-            track_name: "audio0".to_string(),
-        };
-        let echoed_rx = observer
-            .subscribe(&bot_track)
-            .expect("subscribe echo track");
-
-        let (out_tx, _out_rx) = mpsc::unbounded_channel::<OutMsg>();
-        let worker = start_echo_worker(
-            "550e8400-e29b-41d4-a716-446655440000",
-            &session,
-            bot_pubkey_hex,
-            peer_pubkey_hex,
-            out_tx,
-        )
-        .expect("start echo worker");
-
-        let codec = OpusCodec;
-        for i in 0..10u64 {
-            let pcm = vec![i as i16, (i as i16).saturating_mul(-1)];
-            let packet = codec.encode_pcm_i16(&pcm);
-            let frame = MediaFrame {
-                seq: i,
-                timestamp_us: i * 20_000,
-                keyframe: true,
-                payload: packet.0,
-            };
-            let delivered = peer.publish(&peer_track, frame).expect("publish input");
-            assert_eq!(delivered, 1);
-        }
-
-        let mut echoed = 0usize;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while echoed < 10 && tokio::time::Instant::now() < deadline {
-            while echoed_rx.try_recv().is_ok() {
-                echoed += 1;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        worker.stop().await;
-
-        assert_eq!(echoed, 10, "expected all frames to be echoed");
+        let stats = run_audio_echo_smoke(10).await.expect("audio echo smoke");
+        assert_eq!(stats.sent_frames, 10);
+        assert_eq!(stats.echoed_frames, 10);
     }
 }

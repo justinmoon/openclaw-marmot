@@ -154,6 +154,13 @@ enum ScenarioCommand {
         #[arg(long, default_value_t = 60 * 60 * 24 * 3)]
         giftwrap_lookback_sec: u64,
     },
+
+    /// Phase 3 audio smoke: bot-like participant echoes media frames over in-memory transport.
+    AudioEcho {
+        /// Number of synthetic frames to publish and require as echoed.
+        #[arg(long, default_value_t = 50)]
+        frames: u64,
+    },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -217,6 +224,16 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
             .context("scenario invite-and-chat-peer failed"),
+            ScenarioCommand::AudioEcho { frames } => {
+                let stats = daemon::run_audio_echo_smoke(frames)
+                    .await
+                    .context("audio echo smoke failed")?;
+                info!(
+                    "[phase3-audio] ok sent_frames={} echoed_frames={}",
+                    stats.sent_frames, stats.echoed_frames
+                );
+                Ok(())
+            }
         },
         Command::Bot {
             relay,

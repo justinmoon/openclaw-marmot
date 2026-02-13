@@ -121,6 +121,7 @@ Then set `sidecarCmd` in your channel config to the absolute path of the binary:
 - Phase 1: `PLAN.md` (Rust <-> Rust over local Docker relay)
 - Phase 2: `OPENCLAW-INTEGRATION-PLAN.md` (Rust harness <-> deterministic Rust bot process)
 - Phase 3: `OPENCLAW-CHANNEL-DESIGN.md` + `rust_harness daemon` (JSONL sidecar integration surface)
+- Phase 3 Audio: in-memory call echo smoke (`marmotd scenario audio-echo`)
 - Phase 4: Local OpenClaw gateway E2E: Rust harness <-> OpenClaw `marmot` channel (Rust sidecar spawned by OpenClaw)
 
 ### Run Phase 1
@@ -145,6 +146,12 @@ Defaults:
 ./scripts/phase3.sh
 ```
 
+### Run Phase 3 Audio Echo Smoke
+
+```sh
+./scripts/phase3_audio.sh
+```
+
 ### Run Phase 4 (OpenClaw Marmot Plugin E2E)
 
 This uses the pinned OpenClaw checkout under `./openclaw/`, runs a local relay on a random port,
@@ -154,3 +161,12 @@ scenario against the plugin's pubkey.
 ```sh
 ./scripts/phase4_openclaw_marmot.sh
 ```
+
+## Cleanup
+
+Deferred cleanup notes (intentionally postponed to keep momentum):
+
+- Replace local path dependency on `pika-media` (`marmotd/Cargo.toml`) with a proper published/git dependency once the API stabilizes.
+- Replace in-memory media relay scaffolding with real MOQ relay transport for call media E2E.
+- When call transport tests move into `pika`, prefer a real local MOQ relay path where feasible (not only in-memory relay tests).
+- Keep MOQ versions aligned between code dependencies and dev environment tooling (same pinned revision for Cargo deps and `flake.nix` input).
