@@ -26,6 +26,26 @@ type SidecarOutMsg =
       content: string;
       created_at: number;
       message_id: string;
+    }
+  | {
+      type: "call_invite_received";
+      call_id: string;
+      from_pubkey: string;
+      nostr_group_id: string;
+    }
+  | {
+      type: "call_session_started";
+      call_id: string;
+      nostr_group_id: string;
+      from_pubkey: string;
+    }
+  | { type: "call_session_ended"; call_id: string; reason: string }
+  | {
+      type: "call_debug";
+      call_id: string;
+      tx_frames: number;
+      rx_frames: number;
+      rx_dropped: number;
     };
 
 type SidecarInCmd =
@@ -35,6 +55,9 @@ type SidecarInCmd =
   | { cmd: "accept_welcome"; request_id: string; wrapper_event_id: string }
   | { cmd: "list_groups"; request_id: string }
   | { cmd: "send_message"; request_id: string; nostr_group_id: string; content: string }
+  | { cmd: "accept_call"; request_id: string; call_id: string }
+  | { cmd: "reject_call"; request_id: string; call_id: string; reason?: string }
+  | { cmd: "end_call"; request_id: string; call_id: string; reason?: string }
   | { cmd: "shutdown"; request_id: string };
 
 type SidecarEventHandler = (msg: SidecarOutMsg) => void | Promise<void>;
@@ -183,6 +206,18 @@ export class MarmotSidecar {
 
   async sendMessage(nostrGroupId: string, content: string): Promise<void> {
     await this.request({ cmd: "send_message", nostr_group_id: nostrGroupId, content } as any);
+  }
+
+  async acceptCall(callId: string): Promise<void> {
+    await this.request({ cmd: "accept_call", call_id: callId } as any);
+  }
+
+  async rejectCall(callId: string, reason?: string): Promise<void> {
+    await this.request({ cmd: "reject_call", call_id: callId, reason } as any);
+  }
+
+  async endCall(callId: string, reason?: string): Promise<void> {
+    await this.request({ cmd: "end_call", call_id: callId, reason } as any);
   }
 
   async shutdown(): Promise<void> {

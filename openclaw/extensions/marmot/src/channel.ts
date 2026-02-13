@@ -315,6 +315,45 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
           );
           return;
         }
+        if (ev.type === "call_invite_received") {
+          if (!isGroupAllowed(ev.nostr_group_id)) {
+            ctx.log?.debug(
+              `[${resolved.accountId}] reject call invite (group not allowed) group=${ev.nostr_group_id} call_id=${ev.call_id}`,
+            );
+            await sidecar.rejectCall(ev.call_id, "group_not_allowed");
+            return;
+          }
+          if (!isSenderAllowed(ev.from_pubkey)) {
+            ctx.log?.debug(
+              `[${resolved.accountId}] reject call invite (sender not allowed) sender=${ev.from_pubkey} call_id=${ev.call_id}`,
+            );
+            await sidecar.rejectCall(ev.call_id, "sender_not_allowed");
+            return;
+          }
+          ctx.log?.info(
+            `[${resolved.accountId}] accept call invite group=${ev.nostr_group_id} from=${ev.from_pubkey} call_id=${ev.call_id}`,
+          );
+          await sidecar.acceptCall(ev.call_id);
+          return;
+        }
+        if (ev.type === "call_session_started") {
+          ctx.log?.info(
+            `[${resolved.accountId}] call_session_started group=${ev.nostr_group_id} from=${ev.from_pubkey} call_id=${ev.call_id}`,
+          );
+          return;
+        }
+        if (ev.type === "call_session_ended") {
+          ctx.log?.info(
+            `[${resolved.accountId}] call_session_ended call_id=${ev.call_id} reason=${ev.reason}`,
+          );
+          return;
+        }
+        if (ev.type === "call_debug") {
+          ctx.log?.debug(
+            `[${resolved.accountId}] call_debug call_id=${ev.call_id} tx=${ev.tx_frames} rx=${ev.rx_frames} drop=${ev.rx_dropped}`,
+          );
+          return;
+        }
         if (ev.type === "message_received") {
           if (!isGroupAllowed(ev.nostr_group_id)) {
             ctx.log?.debug(
