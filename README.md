@@ -162,6 +162,14 @@ scenario against the plugin's pubkey.
 ./scripts/phase4_openclaw_marmot.sh
 ```
 
+### Run Pre-Merge Suite
+
+```sh
+just pre-merge
+```
+
+This is the canonical local/CI verification lane for `openclaw-marmot`.
+
 ## Cleanup
 
 Deferred cleanup notes (intentionally postponed to keep momentum):

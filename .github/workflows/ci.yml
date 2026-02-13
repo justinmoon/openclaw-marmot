@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  push:
   pull_request:
 
 jobs:
@@ -16,17 +17,11 @@ jobs:
         with:
           components: clippy
 
+      - name: Install just
+        uses: taiki-e/install-action@just
+
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@v2
 
-      - name: Clippy
-        run: cargo clippy -p marmotd -- -D warnings
-
-      - name: Phase 1
-        run: ./scripts/phase1.sh
-
-      - name: Phase 2
-        run: ./scripts/phase2.sh
-
-      - name: Phase 3
-        run: ./scripts/phase3.sh
+      - name: Pre-merge
+        run: just pre-merge
