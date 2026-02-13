@@ -18,6 +18,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
+use crate::call_stt::{OpusToTranscriptPipeline, transcriber_from_env};
+
 const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +141,10 @@ enum OutMsg {
         rx_frames: u64,
         rx_dropped: u64,
     },
+    CallTranscriptFinal {
+        call_id: String,
+        text: String,
+    },
 }
 
 fn default_reject_reason() -> String {
@@ -178,6 +184,11 @@ struct ActiveEchoCall {
     call_id: String,
     nostr_group_id: String,
     worker: EchoWorker,
+}
+
+#[derive(Debug)]
+enum CallWorkerEvent {
+    TranscriptFinal { call_id: String, text: String },
 }
 
 #[derive(Debug)]
@@ -425,22 +436,120 @@ async fn send_call_signal(
     .await
 }
 
-fn start_echo_worker(
+fn call_audio_track_spec(session: &CallSessionParams) -> Option<&CallTrackSpec> {
+    session
+        .tracks
+        .iter()
+        .find(|t| t.codec.eq_ignore_ascii_case("opus") && t.channels > 0 && t.sample_rate > 0)
+}
+
+fn start_stt_worker(
     call_id: &str,
     session: &CallSessionParams,
-    local_pubkey_hex: &str,
     peer_pubkey_hex: &str,
     out_tx: mpsc::UnboundedSender<OutMsg>,
+    call_evt_tx: mpsc::UnboundedSender<CallWorkerEvent>,
 ) -> anyhow::Result<EchoWorker> {
     let relay = shared_call_relay(session);
-    start_echo_worker_with_relay(
+    start_stt_worker_with_relay(
         call_id,
         session,
         relay,
-        local_pubkey_hex,
         peer_pubkey_hex,
         out_tx,
+        call_evt_tx,
     )
+}
+
+fn start_stt_worker_with_relay(
+    call_id: &str,
+    session: &CallSessionParams,
+    relay: InMemoryRelay,
+    peer_pubkey_hex: &str,
+    out_tx: mpsc::UnboundedSender<OutMsg>,
+    call_evt_tx: mpsc::UnboundedSender<CallWorkerEvent>,
+) -> anyhow::Result<EchoWorker> {
+    let Some(track) = call_audio_track_spec(session) else {
+        return Err(anyhow!("call session missing opus audio track"));
+    };
+
+    let mut media = MediaSession::with_relay(
+        SessionConfig {
+            moq_url: session.moq_url.clone(),
+        },
+        relay,
+    );
+    media.connect();
+
+    let subscribe_track = TrackAddress {
+        broadcast_path: broadcast_path(&session.broadcast_base, peer_pubkey_hex)
+            .map_err(|e| anyhow!("invalid peer broadcast path: {e}"))?,
+        track_name: track.name.clone(),
+    };
+    let rx = media
+        .subscribe(&subscribe_track)
+        .context("subscribe peer track for stt")?;
+
+    let mut pipeline = OpusToTranscriptPipeline::new(
+        track.sample_rate,
+        track.channels,
+        transcriber_from_env().context("initialize stt transcriber")?,
+    )
+    .context("initialize stt pipeline")?;
+
+    let call_id = call_id.to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_task = stop.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let mut rx_frames = 0u64;
+        let mut ticks = 0u64;
+        while !stop_for_task.load(Ordering::Relaxed) {
+            while let Ok(inbound) = rx.try_recv() {
+                rx_frames = rx_frames.saturating_add(1);
+                match pipeline.ingest_packet(OpusPacket(inbound.payload)) {
+                    Ok(Some(text)) => {
+                        let _ = call_evt_tx.send(CallWorkerEvent::TranscriptFinal {
+                            call_id: call_id.clone(),
+                            text,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(
+                            "[marmotd] stt ingest failed call_id={} err={err:#}",
+                            call_id
+                        );
+                    }
+                }
+            }
+
+            ticks = ticks.saturating_add(1);
+            if ticks.is_multiple_of(5) {
+                let _ = out_tx.send(OutMsg::CallDebug {
+                    call_id: call_id.clone(),
+                    tx_frames: 0,
+                    rx_frames,
+                    rx_dropped: 0,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        match pipeline.flush() {
+            Ok(Some(text)) => {
+                let _ = call_evt_tx.send(CallWorkerEvent::TranscriptFinal {
+                    call_id: call_id.clone(),
+                    text,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!("[marmotd] stt flush failed call_id={} err={err:#}", call_id);
+            }
+        }
+    });
+
+    Ok(EchoWorker { stop, task })
 }
 
 fn start_echo_worker_with_relay(
@@ -762,6 +871,7 @@ pub async fn daemon_main(
     let mut group_subs: HashMap<SubscriptionId, String> = HashMap::new();
     let mut pending_call_invites: HashMap<String, PendingCallInvite> = HashMap::new();
     let mut active_call: Option<ActiveEchoCall> = None;
+    let (call_evt_tx, mut call_evt_rx) = mpsc::unbounded_channel::<CallWorkerEvent>();
 
     // On startup, subscribe to any groups already present in state, so the daemon is restart-safe.
     if let Ok(groups) = mdk.get_groups() {
@@ -1072,12 +1182,12 @@ pub async fn daemon_main(
                             }
                         }
 
-                        let worker = match start_echo_worker(
+                        let worker = match start_stt_worker(
                             &invite.call_id,
                             &invite.session,
-                            &keys.public_key().to_hex().to_lowercase(),
                             &invite.from_pubkey,
                             out_tx.clone(),
+                            call_evt_tx.clone(),
                         ) {
                             Ok(v) => v,
                             Err(e) => {
@@ -1164,6 +1274,40 @@ pub async fn daemon_main(
                     InCmd::Shutdown { request_id } => {
                         out_tx.send(out_ok(request_id, None)).ok();
                         shutdown = true;
+                    }
+                }
+            }
+            call_evt = call_evt_rx.recv() => {
+                let Some(call_evt) = call_evt else { continue; };
+                match call_evt {
+                    CallWorkerEvent::TranscriptFinal { call_id, text } => {
+                        let Some(nostr_group_id) = active_call
+                            .as_ref()
+                            .filter(|c| c.call_id == call_id)
+                            .map(|c| c.nostr_group_id.clone()) else {
+                                continue;
+                            };
+
+                        let _ = out_tx.send(OutMsg::CallTranscriptFinal {
+                            call_id: call_id.clone(),
+                            text: text.clone(),
+                        });
+                        if let Err(err) = publish_group_message(
+                            &client,
+                            &relay_urls,
+                            &mdk,
+                            &keys,
+                            &nostr_group_id,
+                            text,
+                            "call_transcript_final",
+                        )
+                        .await
+                        {
+                            warn!(
+                                "[marmotd] call transcript publish failed call_id={} group={} err={err:#}",
+                                call_id, nostr_group_id
+                            );
+                        }
                     }
                 }
             }

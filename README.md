@@ -162,6 +162,19 @@ scenario against the plugin's pubkey.
 ./scripts/phase4_openclaw_marmot.sh
 ```
 
+### Phase 4 Call STT -> Text (marmotd daemon)
+
+During active calls, `marmotd` now runs:
+- `Opus -> PCM -> buffer -> transcription`
+- publishes transcript text back into the same MLS group as a normal app message
+- emits sidecar event `call_transcript_final`
+
+Runtime configuration:
+- `OPENAI_API_KEY` (required for real STT)
+- `OPENAI_STT_MODEL` (optional, default `gpt-4o-mini-transcribe`)
+- `OPENAI_BASE_URL` (optional, default `https://api.openai.com/v1`)
+- `MARMOT_STT_FIXTURE_TEXT` (optional deterministic fixture mode for tests/dev; bypasses OpenAI)
+
 ### Run Pre-Merge Suite
 
 ```sh

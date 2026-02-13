@@ -354,6 +354,18 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
           );
           return;
         }
+        if (ev.type === "call_transcript_partial") {
+          ctx.log?.debug(
+            `[${resolved.accountId}] call_transcript_partial call_id=${ev.call_id} text=${JSON.stringify(ev.text)}`,
+          );
+          return;
+        }
+        if (ev.type === "call_transcript_final") {
+          ctx.log?.info(
+            `[${resolved.accountId}] call_transcript_final call_id=${ev.call_id} text=${JSON.stringify(ev.text)}`,
+          );
+          return;
+        }
         if (ev.type === "message_received") {
           if (!isGroupAllowed(ev.nostr_group_id)) {
             ctx.log?.debug(

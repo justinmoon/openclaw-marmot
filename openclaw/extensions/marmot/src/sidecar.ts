@@ -46,6 +46,16 @@ type SidecarOutMsg =
       tx_frames: number;
       rx_frames: number;
       rx_dropped: number;
+    }
+  | {
+      type: "call_transcript_partial";
+      call_id: string;
+      text: string;
+    }
+  | {
+      type: "call_transcript_final";
+      call_id: string;
+      text: string;
     };
 
 type SidecarInCmd =

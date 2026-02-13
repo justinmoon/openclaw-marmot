@@ -13,6 +13,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 use tracing::{Level, info, warn};
 
+mod call_stt;
 mod daemon;
 
 #[derive(Debug, Parser)]
