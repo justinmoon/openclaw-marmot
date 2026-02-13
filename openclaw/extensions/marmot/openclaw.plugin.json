@@ -1,5 +1,5 @@
 {
-  "id": "openclaw-marmot",
+  "id": "marmot",
   "channels": ["marmot"],
   "configSchema": {
     "type": "object",

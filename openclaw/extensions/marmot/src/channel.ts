@@ -138,7 +138,7 @@ function resolveSidecarArgs(cfgArgs?: string[] | null): string[] | null {
 export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
   id: "marmot",
   meta: {
-    id: "openclaw-marmot",
+    id: "marmot",
     label: "Marmot",
     selectionLabel: "Marmot (Rust)",
     docsPath: "/channels/marmot",
@@ -152,7 +152,7 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
     media: false,
     nativeCommands: false,
   },
-  reload: { configPrefixes: ["channels.marmot", "plugins.entries.openclaw-marmot"] },
+  reload: { configPrefixes: ["channels.marmot", "plugins.entries.marmot"] },
 
   config: {
     listAccountIds: (cfg) => listMarmotAccountIds(cfg),

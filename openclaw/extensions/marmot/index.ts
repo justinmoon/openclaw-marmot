@@ -4,7 +4,7 @@ import { marmotPluginConfigSchema } from "./src/config-schema.js";
 import { setMarmotRuntime } from "./src/runtime.js";
 
 const plugin = {
-  id: "openclaw-marmot",
+  id: "marmot",
   name: "Marmot",
   description: "Marmot MLS group messaging over Nostr (Rust sidecar)",
   configSchema: marmotPluginConfigSchema,
