@@ -2604,7 +2604,7 @@ dependencies = [
 [[package]]
 name = "pika-media"
 version = "0.1.0"
-source = "git+https://github.com/sledtools/pika?branch=audio#e0514d293feda0c6b60ca9f836935cf4a4ab1057"
+source = "git+https://github.com/sledtools/pika?branch=audio-2#0869e05ae34c38ba546bd4f84c7454445ea167d4"
 dependencies = [
  "aes-gcm",
  "bytes",
