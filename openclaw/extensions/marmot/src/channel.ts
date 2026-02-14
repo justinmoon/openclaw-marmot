@@ -478,6 +478,16 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
       const cfg = runtime.config.loadConfig();
       const resolved = resolveMarmotAccount({ cfg, accountId: account.accountId });
 
+      // Guard against duplicate startAccount calls for the same account.
+      // Set sentinel immediately (before any awaits) to prevent races.
+      if (activeSidecars.has(resolved.accountId)) {
+        ctx.log?.info(
+          `[${resolved.accountId}] sidecar already running, skipping duplicate startAccount`,
+        );
+        return { stop: () => {} };
+      }
+      activeSidecars.set(resolved.accountId, null as any);
+
       if (!resolved.enabled) {
         throw new Error("marmot account disabled");
       }

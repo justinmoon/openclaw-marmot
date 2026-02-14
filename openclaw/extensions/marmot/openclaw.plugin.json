@@ -63,6 +63,6 @@
         "items": { "type": "string" }
       }
     },
-    "required": ["relays"]
+    "required": []
   }
 }

@@ -37,5 +37,5 @@ export const marmotPluginConfigSchema = {
       },
     },
   },
-  required: ["relays"],
+  required: [],
 } as const;
