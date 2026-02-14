@@ -509,10 +509,38 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
     },
   },
 
-  outbound: {
-    deliveryMode: "direct",
-    textChunkLimit: 4000,
-    sendText: async ({ to, text, accountId }) => {
+  outbound: (() => {
+    /** Upload a local file to catbox.moe and return the public URL. */
+    const uploadLocalFile = async (filePath: string): Promise<string> => {
+      const fs = await import("node:fs");
+      const path = await import("node:path");
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`file not found: ${filePath}`);
+      }
+      const FormData = (await import("node:buffer")).File
+        ? globalThis.FormData
+        : (await import("undici" as any)).FormData;
+      const blob = new Blob([fs.readFileSync(filePath)]);
+      const form = new FormData();
+      form.append("reqtype", "fileupload");
+      form.append("fileToUpload", blob, path.basename(filePath));
+      const resp = await fetch("https://catbox.moe/user/api.php", {
+        method: "POST",
+        body: form,
+        headers: { "User-Agent": "Mozilla/5.0 marmot-openclaw" },
+      });
+      if (!resp.ok) throw new Error(`catbox upload failed: ${resp.status}`);
+      const url = (await resp.text()).trim();
+      if (!url.startsWith("http")) throw new Error(`catbox returned unexpected: ${url}`);
+      return url;
+    };
+
+    const isLocalPath = (s: string) =>
+      s.startsWith("/") || s.startsWith("./") || s.startsWith("file://");
+
+    const sendMarmotMessage = async ({ to, text, mediaUrl, accountId }: {
+      to: string; text: string; mediaUrl?: string; accountId?: string | null;
+    }) => {
       const aid = accountId ?? DEFAULT_ACCOUNT_ID;
       const handle = activeSidecars.get(aid);
       if (!handle) {
@@ -522,13 +550,33 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
       if (!looksLikeGroupIdHex(groupId)) {
         throw new Error(`invalid marmot group id: ${to}`);
       }
-      await handle.sidecar.sendMessage(groupId, text ?? "");
-      return { channel: "marmot", to: groupId };
-    },
-    sendMedia: async () => {
-      throw new Error("marmot does not support media");
-    },
-  },
+      // MLS messages are text-only; upload local files and include URL inline
+      let resolvedMediaUrl = mediaUrl;
+      if (resolvedMediaUrl && isLocalPath(resolvedMediaUrl)) {
+        const localPath = resolvedMediaUrl.startsWith("file://")
+          ? resolvedMediaUrl.slice(7)
+          : resolvedMediaUrl;
+        try {
+          resolvedMediaUrl = await uploadLocalFile(localPath);
+          getMarmotRuntime().logger?.info(`[marmot] uploaded ${localPath} → ${resolvedMediaUrl}`);
+        } catch (err) {
+          getMarmotRuntime().logger?.error(`[marmot] file upload failed: ${err}`);
+        }
+      }
+      const parts: string[] = [];
+      if (text) parts.push(text);
+      if (resolvedMediaUrl) parts.push(resolvedMediaUrl);
+      await handle.sidecar.sendMessage(groupId, parts.join("\n") || "[empty]");
+      return { channel: "marmot" as const, to: groupId };
+    };
+
+    return {
+      deliveryMode: "direct" as const,
+      textChunkLimit: 4000,
+      sendText: async (ctx: any) => sendMarmotMessage(ctx),
+      sendMedia: async (ctx: any) => sendMarmotMessage(ctx),
+    };
+  })(),
 
   gateway: {
     startAccount: async (ctx) => {
