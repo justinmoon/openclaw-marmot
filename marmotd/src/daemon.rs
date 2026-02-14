@@ -2116,11 +2116,29 @@ pub async fn daemon_main(
                                     stats.frames_published,
                                     stats.next_seq
                                 );
+                                let publish_path = broadcast_path(
+                                    &current.session.broadcast_base,
+                                    &current.media_crypto.local_participant_label,
+                                )
+                                .ok();
+                                let subscribe_path = broadcast_path(
+                                    &current.session.broadcast_base,
+                                    &current.media_crypto.peer_participant_label,
+                                )
+                                .ok();
+                                let track_name = call_audio_track_spec(&current.session)
+                                    .map(|t| t.name.clone())
+                                    .unwrap_or_default();
                                 let _ = out_tx.send(out_ok(
                                     request_id,
                                     Some(json!({
                                         "call_id": call_id,
                                         "frames_published": stats.frames_published,
+                                        "publish_path": publish_path,
+                                        "subscribe_path": subscribe_path,
+                                        "track": track_name,
+                                        "local_label": current.media_crypto.local_participant_label,
+                                        "peer_label": current.media_crypto.peer_participant_label,
                                     })),
                                 ));
                             }
