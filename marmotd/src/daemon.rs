@@ -5,12 +5,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
+use mdk_core::encrypted_media::crypto::{DEFAULT_SCHEME_VERSION, derive_encryption_key};
 use mdk_core::prelude::*;
 use mdk_sqlite_storage::MdkSqliteStorage;
+use nostr_sdk::hashes::{Hash as _, sha256};
 use nostr_sdk::prelude::*;
 use pika_media::codec_opus::{OpusCodec, OpusPacket};
+use pika_media::crypto::{
+    FrameInfo, FrameKeyMaterial, decrypt_frame, encrypt_frame, opaque_participant_label,
+};
 use pika_media::network::NetworkRelay;
-use pika_media::session::{InMemoryRelay, MediaFrame, MediaSession, MediaSessionError, SessionConfig};
+use pika_media::session::{
+    InMemoryRelay, MediaFrame, MediaSession, MediaSessionError, SessionConfig,
+};
 use pika_media::tracks::{TrackAddress, broadcast_path};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -23,6 +30,8 @@ use crate::call_stt::{OpusToTranscriptPipeline, transcriber_from_env};
 use crate::call_tts::synthesize_tts_pcm;
 
 const PROTOCOL_VERSION: u32 = 1;
+const RELAY_AUTH_CAP_PREFIX: &str = "capv1_";
+const RELAY_AUTH_HEX_LEN: usize = 64;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -194,8 +203,17 @@ struct ActiveEchoCall {
     call_id: String,
     nostr_group_id: String,
     session: CallSessionParams,
+    media_crypto: CallMediaCryptoContext,
     next_voice_seq: u64,
     worker: EchoWorker,
+}
+
+#[derive(Debug, Clone)]
+struct CallMediaCryptoContext {
+    tx_keys: FrameKeyMaterial,
+    rx_keys: FrameKeyMaterial,
+    local_participant_label: String,
+    peer_participant_label: String,
 }
 
 #[derive(Debug)]
@@ -245,7 +263,9 @@ impl CallMediaTransport {
         if is_real_moq_url(&params.moq_url) {
             let relay = NetworkRelay::new(&params.moq_url)
                 .map_err(|e| anyhow!("network relay init: {e}"))?;
-            relay.connect().map_err(|e| anyhow!("network relay connect: {e}"))?;
+            relay
+                .connect()
+                .map_err(|e| anyhow!("network relay connect: {e}"))?;
             Ok(Self::Network { relay })
         } else {
             let im_relay = shared_call_relay(params);
@@ -256,21 +276,11 @@ impl CallMediaTransport {
                 },
                 im_relay,
             );
-            session.connect().map_err(|e| anyhow!("in-memory connect: {e}"))?;
+            session
+                .connect()
+                .map_err(|e| anyhow!("in-memory connect: {e}"))?;
             Ok(Self::InMemory { session })
         }
-    }
-
-    fn from_in_memory_relay(params: &CallSessionParams, relay: InMemoryRelay) -> anyhow::Result<Self> {
-        let mut session = MediaSession::with_relay(
-            SessionConfig {
-                moq_url: params.moq_url.clone(),
-                relay_auth: params.relay_auth.clone(),
-            },
-            relay,
-        );
-        session.connect().map_err(|e| anyhow!("in-memory connect: {e}"))?;
-        Ok(Self::InMemory { session })
     }
 
     fn publish(&self, track: &TrackAddress, frame: MediaFrame) -> Result<usize, MediaSessionError> {
@@ -280,7 +290,10 @@ impl CallMediaTransport {
         }
     }
 
-    fn subscribe(&self, track: &TrackAddress) -> Result<std::sync::mpsc::Receiver<MediaFrame>, MediaSessionError> {
+    fn subscribe(
+        &self,
+        track: &TrackAddress,
+    ) -> Result<std::sync::mpsc::Receiver<MediaFrame>, MediaSessionError> {
         match self {
             Self::InMemory { session } => session.subscribe(track),
             Self::Network { relay } => relay.subscribe(track),
@@ -292,7 +305,8 @@ fn default_audio_call_session(call_id: &str) -> CallSessionParams {
     CallSessionParams {
         moq_url: "https://moq.justinmoon.com/anon".to_string(),
         broadcast_base: format!("pika/calls/{call_id}"),
-        relay_auth: "capv1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        relay_auth: "capv1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .to_string(),
         tracks: vec![CallTrackSpec {
             name: "audio0".to_string(),
             codec: "opus".to_string(),
@@ -443,6 +457,219 @@ fn build_call_signal_json(call_id: &str, signal: OutgoingCallSignal<'_>) -> anyh
     serde_json::to_string(&value).context("serialize call signal")
 }
 
+fn context_hash(parts: &[&[u8]]) -> [u8; 32] {
+    let mut buf = Vec::new();
+    for part in parts {
+        let len: u32 = part.len().try_into().unwrap_or(u32::MAX);
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(part);
+    }
+    sha256::Hash::hash(&buf).to_byte_array()
+}
+
+fn key_id_for_sender(sender_id: &[u8]) -> u64 {
+    let digest = context_hash(&[b"pika.call.media.keyid.v1", sender_id]);
+    u64::from_be_bytes(digest[0..8].try_into().expect("hash width"))
+}
+
+fn call_shared_seed(
+    call_id: &str,
+    session: &CallSessionParams,
+    local_pubkey_hex: &str,
+    peer_pubkey_hex: &str,
+) -> String {
+    let (left, right) = if local_pubkey_hex <= peer_pubkey_hex {
+        (local_pubkey_hex, peer_pubkey_hex)
+    } else {
+        (peer_pubkey_hex, local_pubkey_hex)
+    };
+    format!(
+        "pika-call-media-v1|{call_id}|{}|{}|{}|{}",
+        session.moq_url, session.broadcast_base, left, right
+    )
+}
+
+fn valid_relay_auth_token(token: &str) -> bool {
+    let trimmed = token.trim();
+    let Some(hex_part) = trimmed.strip_prefix(RELAY_AUTH_CAP_PREFIX) else {
+        return false;
+    };
+    hex_part.len() == RELAY_AUTH_HEX_LEN && hex_part.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn derive_relay_auth_token(
+    mdk: &MDK<MdkSqliteStorage>,
+    nostr_group_id: &str,
+    call_id: &str,
+    session: &CallSessionParams,
+    local_pubkey_hex: &str,
+    peer_pubkey_hex: &str,
+) -> anyhow::Result<String> {
+    let group_id_bytes = hex::decode(nostr_group_id).context("decode nostr_group_id")?;
+    if group_id_bytes.len() != 32 {
+        return Err(anyhow!("nostr_group_id must be 32 bytes hex"));
+    }
+    let groups = mdk.get_groups().context("get_groups")?;
+    let Some(group_entry) = groups
+        .iter()
+        .find(|g| g.nostr_group_id.as_slice() == group_id_bytes.as_slice())
+    else {
+        return Err(anyhow!(
+            "group not found for nostr_group_id={nostr_group_id}"
+        ));
+    };
+
+    let shared_seed = call_shared_seed(call_id, session, local_pubkey_hex, peer_pubkey_hex);
+    let auth_hash = context_hash(&[
+        b"pika.call.relay.auth.seed.v1",
+        shared_seed.as_bytes(),
+        call_id.as_bytes(),
+    ]);
+    let auth_key = *derive_encryption_key(
+        mdk,
+        &group_entry.mls_group_id,
+        DEFAULT_SCHEME_VERSION,
+        &auth_hash,
+        "application/pika-call-auth",
+        &format!("call/{call_id}/relay-auth"),
+    )
+    .map_err(|e| anyhow!("derive relay auth token failed: {e}"))?;
+    let token_hash = context_hash(&[
+        b"pika.call.relay.auth.token.v1",
+        &auth_key,
+        call_id.as_bytes(),
+        session.moq_url.as_bytes(),
+        session.broadcast_base.as_bytes(),
+    ]);
+    Ok(format!("capv1_{}", hex::encode(token_hash)))
+}
+
+fn validate_relay_auth_token(
+    mdk: &MDK<MdkSqliteStorage>,
+    nostr_group_id: &str,
+    call_id: &str,
+    session: &CallSessionParams,
+    local_pubkey_hex: &str,
+    peer_pubkey_hex: &str,
+) -> anyhow::Result<()> {
+    if !valid_relay_auth_token(&session.relay_auth) {
+        return Err(anyhow!("call relay auth token format invalid"));
+    }
+    let expected = derive_relay_auth_token(
+        mdk,
+        nostr_group_id,
+        call_id,
+        session,
+        local_pubkey_hex,
+        peer_pubkey_hex,
+    )?;
+    if expected != session.relay_auth {
+        return Err(anyhow!("call relay auth token mismatch"));
+    }
+    Ok(())
+}
+
+fn derive_mls_media_crypto_context(
+    mdk: &MDK<MdkSqliteStorage>,
+    nostr_group_id: &str,
+    call_id: &str,
+    session: &CallSessionParams,
+    local_pubkey_hex: &str,
+    peer_pubkey_hex: &str,
+) -> anyhow::Result<CallMediaCryptoContext> {
+    let group_id_bytes = hex::decode(nostr_group_id).context("decode nostr_group_id")?;
+    if group_id_bytes.len() != 32 {
+        return Err(anyhow!("nostr_group_id must be 32 bytes hex"));
+    }
+    let groups = mdk.get_groups().context("get_groups")?;
+    let Some(group_entry) = groups
+        .iter()
+        .find(|g| g.nostr_group_id.as_slice() == group_id_bytes.as_slice())
+    else {
+        return Err(anyhow!(
+            "group not found for nostr_group_id={nostr_group_id}"
+        ));
+    };
+    let group = mdk
+        .get_group(&group_entry.mls_group_id)
+        .map_err(|e| anyhow!("load mls group failed: {e}"))?
+        .ok_or_else(|| anyhow!("mls group not found"))?;
+
+    let shared_seed = call_shared_seed(call_id, session, local_pubkey_hex, peer_pubkey_hex);
+    let track = "audio0";
+    let generation = 0u8;
+    let tx_hash = context_hash(&[
+        b"pika.call.media.base.v1",
+        shared_seed.as_bytes(),
+        local_pubkey_hex.as_bytes(),
+        track.as_bytes(),
+    ]);
+    let rx_hash = context_hash(&[
+        b"pika.call.media.base.v1",
+        shared_seed.as_bytes(),
+        peer_pubkey_hex.as_bytes(),
+        track.as_bytes(),
+    ]);
+    let root_hash = context_hash(&[
+        b"pika.call.media.root.v1",
+        shared_seed.as_bytes(),
+        track.as_bytes(),
+    ]);
+
+    let tx_filename = format!("call/{call_id}/{track}/{local_pubkey_hex}");
+    let rx_filename = format!("call/{call_id}/{track}/{peer_pubkey_hex}");
+    let root_filename = format!("call/{call_id}/{track}/group-root");
+
+    let tx_base = *derive_encryption_key(
+        mdk,
+        &group_entry.mls_group_id,
+        DEFAULT_SCHEME_VERSION,
+        &tx_hash,
+        "application/pika-call",
+        &tx_filename,
+    )
+    .map_err(|e| anyhow!("derive tx media key failed: {e}"))?;
+    let rx_base = *derive_encryption_key(
+        mdk,
+        &group_entry.mls_group_id,
+        DEFAULT_SCHEME_VERSION,
+        &rx_hash,
+        "application/pika-call",
+        &rx_filename,
+    )
+    .map_err(|e| anyhow!("derive rx media key failed: {e}"))?;
+    let group_root = *derive_encryption_key(
+        mdk,
+        &group_entry.mls_group_id,
+        DEFAULT_SCHEME_VERSION,
+        &root_hash,
+        "application/pika-call",
+        &root_filename,
+    )
+    .map_err(|e| anyhow!("derive media group root failed: {e}"))?;
+
+    Ok(CallMediaCryptoContext {
+        tx_keys: FrameKeyMaterial::from_base_key(
+            tx_base,
+            key_id_for_sender(local_pubkey_hex.as_bytes()),
+            group.epoch,
+            generation,
+            track,
+            group_root,
+        ),
+        rx_keys: FrameKeyMaterial::from_base_key(
+            rx_base,
+            key_id_for_sender(peer_pubkey_hex.as_bytes()),
+            group.epoch,
+            generation,
+            track,
+            group_root,
+        ),
+        local_participant_label: opaque_participant_label(&group_root, local_pubkey_hex.as_bytes()),
+        peer_participant_label: opaque_participant_label(&group_root, peer_pubkey_hex.as_bytes()),
+    })
+}
+
 async fn publish_group_message(
     client: &Client,
     relay_urls: &[RelayUrl],
@@ -557,18 +784,18 @@ struct VoicePublishStats {
 fn publish_tts_audio_response_with_relay(
     session: &CallSessionParams,
     relay: InMemoryRelay,
-    local_pubkey_hex: &str,
+    media_crypto: &CallMediaCryptoContext,
     start_seq: u64,
     tts_text: &str,
 ) -> anyhow::Result<VoicePublishStats> {
     let tts_pcm = synthesize_tts_pcm(tts_text).context("synthesize call tts")?;
-    publish_pcm_audio_response_with_relay(session, relay, local_pubkey_hex, start_seq, tts_pcm)
+    publish_pcm_audio_response_with_relay(session, relay, media_crypto, start_seq, tts_pcm)
 }
 
 fn publish_pcm_audio_response_with_relay(
     session: &CallSessionParams,
     relay: InMemoryRelay,
-    local_pubkey_hex: &str,
+    media_crypto: &CallMediaCryptoContext,
     start_seq: u64,
     tts_pcm: crate::call_tts::TtsPcm,
 ) -> anyhow::Result<VoicePublishStats> {
@@ -591,8 +818,11 @@ fn publish_pcm_audio_response_with_relay(
     );
     media.connect().map_err(|e| anyhow::anyhow!("{e}"))?;
     let publish_track = TrackAddress {
-        broadcast_path: broadcast_path(&session.broadcast_base, local_pubkey_hex)
-            .map_err(|e| anyhow!("invalid local broadcast path: {e}"))?,
+        broadcast_path: broadcast_path(
+            &session.broadcast_base,
+            &media_crypto.local_participant_label,
+        )
+        .map_err(|e| anyhow!("invalid local broadcast path: {e}"))?,
         track_name: track.name.clone(),
     };
 
@@ -612,17 +842,30 @@ fn publish_pcm_audio_response_with_relay(
     let mut seq = start_seq;
     let mut frames = 0u64;
     for chunk in pcm.chunks(frame_samples) {
+        let frame_counter =
+            u32::try_from(seq).map_err(|_| anyhow!("call media tx counter exhausted"))?;
         let mut frame_pcm = Vec::with_capacity(frame_samples);
         frame_pcm.extend_from_slice(chunk);
         if frame_pcm.len() < frame_samples {
             frame_pcm.resize(frame_samples, 0);
         }
         let packet = codec.encode_pcm_i16(&frame_pcm);
+        let encrypted = encrypt_frame(
+            &packet.0,
+            &media_crypto.tx_keys,
+            FrameInfo {
+                counter: frame_counter,
+                group_seq: seq,
+                frame_idx: 0,
+                keyframe: true,
+            },
+        )
+        .map_err(|e| anyhow!("encrypt tts frame failed: {e}"))?;
         let frame = MediaFrame {
             seq,
             timestamp_us: seq.saturating_mul((track.frame_ms as u64) * 1_000),
             keyframe: true,
-            payload: packet.0,
+            payload: encrypted,
         };
         media
             .publish(&publish_track, frame)
@@ -640,7 +883,7 @@ fn publish_pcm_audio_response_with_relay(
 fn publish_tts_audio_response_with_transport(
     session: &CallSessionParams,
     transport: CallMediaTransport,
-    local_pubkey_hex: &str,
+    media_crypto: &CallMediaCryptoContext,
     start_seq: u64,
     tts_text: &str,
 ) -> anyhow::Result<VoicePublishStats> {
@@ -650,12 +893,18 @@ fn publish_tts_audio_response_with_transport(
         return Err(anyhow!("call session missing opus audio track"));
     };
     if track.channels != 1 {
-        return Err(anyhow!("tts publish only supports mono (got channels={})", track.channels));
+        return Err(anyhow!(
+            "tts publish only supports mono (got channels={})",
+            track.channels
+        ));
     }
 
     let publish_track = TrackAddress {
-        broadcast_path: broadcast_path(&session.broadcast_base, local_pubkey_hex)
-            .map_err(|e| anyhow!("invalid local broadcast path: {e}"))?,
+        broadcast_path: broadcast_path(
+            &session.broadcast_base,
+            &media_crypto.local_participant_label,
+        )
+        .map_err(|e| anyhow!("invalid local broadcast path: {e}"))?,
         track_name: track.name.clone(),
     };
 
@@ -675,61 +924,85 @@ fn publish_tts_audio_response_with_transport(
     let mut seq = start_seq;
     let mut frames = 0u64;
     for chunk in pcm.chunks(frame_samples) {
+        let frame_counter =
+            u32::try_from(seq).map_err(|_| anyhow!("call media tx counter exhausted"))?;
         let mut frame_pcm = Vec::with_capacity(frame_samples);
         frame_pcm.extend_from_slice(chunk);
         if frame_pcm.len() < frame_samples {
             frame_pcm.resize(frame_samples, 0);
         }
         let packet = codec.encode_pcm_i16(&frame_pcm);
+        let encrypted = encrypt_frame(
+            &packet.0,
+            &media_crypto.tx_keys,
+            FrameInfo {
+                counter: frame_counter,
+                group_seq: seq,
+                frame_idx: 0,
+                keyframe: true,
+            },
+        )
+        .map_err(|e| anyhow!("encrypt tts frame failed: {e}"))?;
         let frame = MediaFrame {
             seq,
             timestamp_us: seq.saturating_mul((track.frame_ms as u64) * 1_000),
             keyframe: true,
-            payload: packet.0,
+            payload: encrypted,
         };
-        transport.publish(&publish_track, frame).context("publish tts frame")?;
+        transport
+            .publish(&publish_track, frame)
+            .context("publish tts frame")?;
         seq = seq.saturating_add(1);
         frames = frames.saturating_add(1);
     }
 
-    Ok(VoicePublishStats { next_seq: seq, frames_published: frames })
+    Ok(VoicePublishStats {
+        next_seq: seq,
+        frames_published: frames,
+    })
 }
 
 fn publish_tts_audio_response(
     session: &CallSessionParams,
-    local_pubkey_hex: &str,
+    media_crypto: &CallMediaCryptoContext,
     start_seq: u64,
     tts_text: &str,
 ) -> anyhow::Result<VoicePublishStats> {
     if is_real_moq_url(&session.moq_url) {
         let transport = CallMediaTransport::for_session(session)?;
-        publish_tts_audio_response_with_transport(session, transport, local_pubkey_hex, start_seq, tts_text)
+        publish_tts_audio_response_with_transport(
+            session,
+            transport,
+            media_crypto,
+            start_seq,
+            tts_text,
+        )
     } else {
         let relay = shared_call_relay(session);
-        publish_tts_audio_response_with_relay(session, relay, local_pubkey_hex, start_seq, tts_text)
+        publish_tts_audio_response_with_relay(session, relay, media_crypto, start_seq, tts_text)
     }
 }
 
 fn start_stt_worker(
     call_id: &str,
     session: &CallSessionParams,
-    peer_pubkey_hex: &str,
+    media_crypto: CallMediaCryptoContext,
     out_tx: mpsc::UnboundedSender<OutMsg>,
     call_evt_tx: mpsc::UnboundedSender<CallWorkerEvent>,
 ) -> anyhow::Result<EchoWorker> {
     if is_real_moq_url(&session.moq_url) {
         let transport = CallMediaTransport::for_session(session)?;
-        start_stt_worker_with_transport(call_id, session, transport, peer_pubkey_hex, out_tx, call_evt_tx)
-    } else {
-        let relay = shared_call_relay(session);
-        start_stt_worker_with_relay(
+        start_stt_worker_with_transport(
             call_id,
             session,
-            relay,
-            peer_pubkey_hex,
+            transport,
+            media_crypto,
             out_tx,
             call_evt_tx,
         )
+    } else {
+        let relay = shared_call_relay(session);
+        start_stt_worker_with_relay(call_id, session, relay, media_crypto, out_tx, call_evt_tx)
     }
 }
 
@@ -737,7 +1010,7 @@ fn start_stt_worker_with_relay(
     call_id: &str,
     session: &CallSessionParams,
     relay: InMemoryRelay,
-    peer_pubkey_hex: &str,
+    media_crypto: CallMediaCryptoContext,
     out_tx: mpsc::UnboundedSender<OutMsg>,
     call_evt_tx: mpsc::UnboundedSender<CallWorkerEvent>,
 ) -> anyhow::Result<EchoWorker> {
@@ -755,8 +1028,11 @@ fn start_stt_worker_with_relay(
     media.connect().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let subscribe_track = TrackAddress {
-        broadcast_path: broadcast_path(&session.broadcast_base, peer_pubkey_hex)
-            .map_err(|e| anyhow!("invalid peer broadcast path: {e}"))?,
+        broadcast_path: broadcast_path(
+            &session.broadcast_base,
+            &media_crypto.peer_participant_label,
+        )
+        .map_err(|e| anyhow!("invalid peer broadcast path: {e}"))?,
         track_name: track.name.clone(),
     };
     let rx = media
@@ -775,11 +1051,20 @@ fn start_stt_worker_with_relay(
     let stop_for_task = stop.clone();
     let task = tokio::task::spawn_blocking(move || {
         let mut rx_frames = 0u64;
+        let mut rx_decrypt_dropped = 0u64;
         let mut ticks = 0u64;
         while !stop_for_task.load(Ordering::Relaxed) {
             while let Ok(inbound) = rx.try_recv() {
+                let decrypted = match decrypt_frame(&inbound.payload, &media_crypto.rx_keys) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        rx_decrypt_dropped = rx_decrypt_dropped.saturating_add(1);
+                        warn!("[marmotd] stt decrypt failed call_id={} err={err}", call_id);
+                        continue;
+                    }
+                };
                 rx_frames = rx_frames.saturating_add(1);
-                match pipeline.ingest_packet(OpusPacket(inbound.payload)) {
+                match pipeline.ingest_packet(OpusPacket(decrypted.payload)) {
                     Ok(Some(text)) => {
                         let _ = call_evt_tx.send(CallWorkerEvent::TranscriptFinal {
                             call_id: call_id.clone(),
@@ -802,7 +1087,7 @@ fn start_stt_worker_with_relay(
                     call_id: call_id.clone(),
                     tx_frames: 0,
                     rx_frames,
-                    rx_dropped: 0,
+                    rx_dropped: rx_decrypt_dropped,
                 });
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -829,7 +1114,7 @@ fn start_stt_worker_with_transport(
     call_id: &str,
     session: &CallSessionParams,
     transport: CallMediaTransport,
-    peer_pubkey_hex: &str,
+    media_crypto: CallMediaCryptoContext,
     out_tx: mpsc::UnboundedSender<OutMsg>,
     call_evt_tx: mpsc::UnboundedSender<CallWorkerEvent>,
 ) -> anyhow::Result<EchoWorker> {
@@ -838,8 +1123,11 @@ fn start_stt_worker_with_transport(
     };
 
     let subscribe_track = TrackAddress {
-        broadcast_path: broadcast_path(&session.broadcast_base, peer_pubkey_hex)
-            .map_err(|e| anyhow!("invalid peer broadcast path: {e}"))?,
+        broadcast_path: broadcast_path(
+            &session.broadcast_base,
+            &media_crypto.peer_participant_label,
+        )
+        .map_err(|e| anyhow!("invalid peer broadcast path: {e}"))?,
         track_name: track.name.clone(),
     };
     let rx = transport
@@ -858,11 +1146,20 @@ fn start_stt_worker_with_transport(
     let stop_for_task = stop.clone();
     let task = tokio::task::spawn_blocking(move || {
         let mut rx_frames = 0u64;
+        let mut rx_decrypt_dropped = 0u64;
         let mut ticks = 0u64;
         while !stop_for_task.load(Ordering::Relaxed) {
             while let Ok(inbound) = rx.try_recv() {
+                let decrypted = match decrypt_frame(&inbound.payload, &media_crypto.rx_keys) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        rx_decrypt_dropped = rx_decrypt_dropped.saturating_add(1);
+                        warn!("[marmotd] stt decrypt failed call_id={} err={err}", call_id);
+                        continue;
+                    }
+                };
                 rx_frames = rx_frames.saturating_add(1);
-                match pipeline.ingest_packet(OpusPacket(inbound.payload)) {
+                match pipeline.ingest_packet(OpusPacket(decrypted.payload)) {
                     Ok(Some(text)) => {
                         let _ = call_evt_tx.send(CallWorkerEvent::TranscriptFinal {
                             call_id: call_id.clone(),
@@ -871,7 +1168,10 @@ fn start_stt_worker_with_transport(
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        warn!("[marmotd] stt ingest failed call_id={} err={err:#}", call_id);
+                        warn!(
+                            "[marmotd] stt ingest failed call_id={} err={err:#}",
+                            call_id
+                        );
                     }
                 }
             }
@@ -882,7 +1182,7 @@ fn start_stt_worker_with_transport(
                     call_id: call_id.clone(),
                     tx_frames: 0,
                     rx_frames,
-                    rx_dropped: 0,
+                    rx_dropped: rx_decrypt_dropped,
                 });
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1520,6 +1820,42 @@ pub async fn daemon_main(
                             let _ = out_tx.send(out_error(request_id, "not_found", "pending call invite not found"));
                             continue;
                         };
+                        if let Err(err) = validate_relay_auth_token(
+                            &mdk,
+                            &invite.nostr_group_id,
+                            &invite.call_id,
+                            &invite.session,
+                            &pubkey_hex,
+                            &invite.from_pubkey,
+                        ) {
+                            let _ = send_call_signal(
+                                &client,
+                                &relay_urls,
+                                &mdk,
+                                &keys,
+                                &invite.nostr_group_id,
+                                &invite.call_id,
+                                OutgoingCallSignal::Reject { reason: "auth_failed" },
+                                "call_reject_auth_failed",
+                            )
+                            .await;
+                            let _ = out_tx.send(out_error(request_id, "auth_failed", format!("{err:#}")));
+                            continue;
+                        }
+                        let media_crypto = match derive_mls_media_crypto_context(
+                            &mdk,
+                            &invite.nostr_group_id,
+                            &invite.call_id,
+                            &invite.session,
+                            &pubkey_hex,
+                            &invite.from_pubkey,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = out_tx.send(out_error(request_id, "runtime_error", format!("{e:#}")));
+                                continue;
+                            }
+                        };
 
                         match send_call_signal(
                             &client,
@@ -1541,7 +1877,7 @@ pub async fn daemon_main(
                         let worker = match start_stt_worker(
                             &invite.call_id,
                             &invite.session,
-                            &invite.from_pubkey,
+                            media_crypto.clone(),
                             out_tx.clone(),
                             call_evt_tx.clone(),
                         ) {
@@ -1556,6 +1892,7 @@ pub async fn daemon_main(
                             call_id: invite.call_id.clone(),
                             nostr_group_id: invite.nostr_group_id.clone(),
                             session: invite.session.clone(),
+                            media_crypto,
                             next_voice_seq: 0,
                             worker,
                         });
@@ -1648,7 +1985,7 @@ pub async fn daemon_main(
                         }
                         match publish_tts_audio_response(
                             &current.session,
-                            &pubkey_hex,
+                            &current.media_crypto,
                             current.next_voice_seq,
                             &tts_text,
                         ) {
@@ -1951,6 +2288,34 @@ mod tests {
         let session = default_audio_call_session(call_id);
         let relay = InMemoryRelay::new();
         let bot_pubkey_hex = "2284fc7b932b5dbbdaa2185c76a4e17a2ef928d4a82e29b812986b454b957f8f";
+        let peer_pubkey_hex = "11b9a894813efe60d39f8621ae9dc4c6d26de4732411c1cdf4bb15e88898a19c";
+        let group_root = [7u8; 32];
+        let media_crypto = CallMediaCryptoContext {
+            tx_keys: FrameKeyMaterial::from_base_key(
+                [9u8; 32],
+                key_id_for_sender(bot_pubkey_hex.as_bytes()),
+                1,
+                0,
+                "audio0",
+                group_root,
+            ),
+            rx_keys: FrameKeyMaterial::from_base_key(
+                [5u8; 32],
+                key_id_for_sender(peer_pubkey_hex.as_bytes()),
+                1,
+                0,
+                "audio0",
+                group_root,
+            ),
+            local_participant_label: opaque_participant_label(
+                &group_root,
+                bot_pubkey_hex.as_bytes(),
+            ),
+            peer_participant_label: opaque_participant_label(
+                &group_root,
+                peer_pubkey_hex.as_bytes(),
+            ),
+        };
 
         let mut observer = MediaSession::with_relay(
             SessionConfig {
@@ -1959,12 +2324,13 @@ mod tests {
             },
             relay.clone(),
         );
-        observer
-            .connect()
-            .expect("observer connect");
+        observer.connect().expect("observer connect");
         let bot_track = TrackAddress {
-            broadcast_path: broadcast_path(&session.broadcast_base, bot_pubkey_hex)
-                .expect("bot broadcast path"),
+            broadcast_path: broadcast_path(
+                &session.broadcast_base,
+                &media_crypto.local_participant_label,
+            )
+            .expect("bot broadcast path"),
             track_name: "audio0".to_string(),
         };
         let echoed_rx = observer.subscribe(&bot_track).expect("subscribe bot track");
@@ -1979,7 +2345,7 @@ mod tests {
         let stats = publish_pcm_audio_response_with_relay(
             &session,
             relay,
-            bot_pubkey_hex,
+            &media_crypto,
             0,
             crate::call_tts::TtsPcm {
                 sample_rate_hz: 48_000,
@@ -1993,7 +2359,10 @@ mod tests {
         let mut echoed_frames = 0u64;
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while echoed_frames < stats.frames_published && std::time::Instant::now() < deadline {
-            while echoed_rx.try_recv().is_ok() {
+            while let Ok(frame) = echoed_rx.try_recv() {
+                let opened =
+                    decrypt_frame(&frame.payload, &media_crypto.tx_keys).expect("decrypt frame");
+                let _ = OpusCodec.decode_to_pcm_i16(&OpusPacket(opened.payload));
                 echoed_frames = echoed_frames.saturating_add(1);
             }
             std::thread::sleep(Duration::from_millis(20));

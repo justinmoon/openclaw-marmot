@@ -6,3 +6,5 @@ node_modules/
 **/node_modules/
 .bak/
 RELAY_IMAGE.txt
+.env
+.env.*

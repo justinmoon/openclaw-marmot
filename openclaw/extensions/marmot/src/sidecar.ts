@@ -68,6 +68,7 @@ type SidecarInCmd =
   | { cmd: "accept_call"; request_id: string; call_id: string }
   | { cmd: "reject_call"; request_id: string; call_id: string; reason?: string }
   | { cmd: "end_call"; request_id: string; call_id: string; reason?: string }
+  | { cmd: "send_audio_response"; request_id: string; call_id: string; tts_text: string }
   | { cmd: "shutdown"; request_id: string };
 
 type SidecarEventHandler = (msg: SidecarOutMsg) => void | Promise<void>;
@@ -228,6 +229,10 @@ export class MarmotSidecar {
 
   async endCall(callId: string, reason?: string): Promise<void> {
     await this.request({ cmd: "end_call", call_id: callId, reason } as any);
+  }
+
+  async sendAudioResponse(callId: string, ttsText: string): Promise<void> {
+    await this.request({ cmd: "send_audio_response", call_id: callId, tts_text: ttsText } as any);
   }
 
   async shutdown(): Promise<void> {

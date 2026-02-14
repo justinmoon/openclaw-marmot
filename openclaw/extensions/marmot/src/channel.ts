@@ -279,6 +279,7 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
       const groupAllowFrom =
         (resolved.config.groupAllowFrom ?? []).map((x) => String(x).trim().toLowerCase()).filter(Boolean);
       const allowedGroups = resolved.config.groups ?? {};
+      const activeCalls = new Map<string, { chatId: string; senderId: string }>();
 
       const isGroupAllowed = (nostrGroupId: string): boolean => {
         if (groupPolicy === "open") return true;
@@ -337,12 +338,17 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
           return;
         }
         if (ev.type === "call_session_started") {
+          activeCalls.set(ev.call_id, {
+            chatId: ev.nostr_group_id,
+            senderId: ev.from_pubkey,
+          });
           ctx.log?.info(
             `[${resolved.accountId}] call_session_started group=${ev.nostr_group_id} from=${ev.from_pubkey} call_id=${ev.call_id}`,
           );
           return;
         }
         if (ev.type === "call_session_ended") {
+          activeCalls.delete(ev.call_id);
           ctx.log?.info(
             `[${resolved.accountId}] call_session_ended call_id=${ev.call_id} reason=${ev.reason}`,
           );
@@ -364,6 +370,34 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
           ctx.log?.info(
             `[${resolved.accountId}] call_transcript_final call_id=${ev.call_id} text=${JSON.stringify(ev.text)}`,
           );
+          const callCtx = activeCalls.get(ev.call_id);
+          if (!callCtx) {
+            ctx.log?.debug(
+              `[${resolved.accountId}] call_transcript_final with no active call context call_id=${ev.call_id}`,
+            );
+            return;
+          }
+          const transcript = ev.text?.trim();
+          if (!transcript) {
+            return;
+          }
+          try {
+            await dispatchInboundToAgent({
+              runtime,
+              accountId: resolved.accountId,
+              senderId: callCtx.senderId,
+              chatId: callCtx.chatId,
+              text: transcript,
+              deliverText: async (responseText: string) => {
+                await sidecar.sendAudioResponse(ev.call_id, responseText);
+              },
+              log: ctx.log,
+            });
+          } catch (err) {
+            ctx.log?.error(
+              `[${resolved.accountId}] voice transcript dispatch failed call_id=${ev.call_id}: ${err}`,
+            );
+          }
           return;
         }
         if (ev.type === "message_received") {

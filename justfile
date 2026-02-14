@@ -24,6 +24,9 @@ phase3:
 phase3-audio:
     ./scripts/phase3_audio.sh
 
+phase8-voice:
+    MARMOT_TTS_FIXTURE=1 cargo test -p marmotd daemon::tests::tts_pcm_publish_reaches_subscriber -- --nocapture
+
 pre-merge:
     just fmt
     just clippy
@@ -32,3 +35,4 @@ pre-merge:
     just phase2
     just phase3
     just phase3-audio
+    just phase8-voice

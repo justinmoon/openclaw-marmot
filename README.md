@@ -175,6 +175,27 @@ Runtime configuration:
 - `OPENAI_BASE_URL` (optional, default `https://api.openai.com/v1`)
 - `MARMOT_STT_FIXTURE_TEXT` (optional deterministic fixture mode for tests/dev; bypasses OpenAI)
 
+### Phase 8 Bot Full Duplex Voice (STT -> LLM -> TTS -> Opus)
+
+The sidecar/plugin path now supports:
+- daemon command `send_audio_response { call_id, tts_text }`
+- OpenClaw plugin wiring: on `call_transcript_final`, dispatch transcript to the agent and stream
+  the agent reply back into the active call as synthesized Opus audio
+- TTS synthesis defaults to OpenAI audio speech endpoint
+
+Runtime configuration for TTS:
+- `OPENAI_API_KEY` (required for real TTS, unless fixture mode enabled)
+- `OPENAI_TTS_MODEL` (optional, default `gpt-4o-mini-tts`)
+- `OPENAI_TTS_VOICE` (optional, default `alloy`)
+- `OPENAI_BASE_URL` (optional, default `https://api.openai.com/v1`)
+- `MARMOT_TTS_FIXTURE=1` (optional deterministic fixture tone mode for tests/dev)
+
+Phase-8 local verification lane:
+
+```sh
+just phase8-voice
+```
+
 ### Run Pre-Merge Suite
 
 ```sh
