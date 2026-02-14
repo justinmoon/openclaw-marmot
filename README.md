@@ -70,6 +70,35 @@ Add the channel config to `~/.openclaw/openclaw.json`:
 
 Replace `<hex-pubkey-of-allowed-sender>` with the Nostr public key(s) you want to accept messages from.
 
+### Group Chat Support
+
+The plugin supports multi-participant MLS group chats with mention gating, sender identity resolution, and owner/friend permission tiers. See **[docs/group-chat.md](docs/group-chat.md)** for the full guide.
+
+Quick setup for group chats — add these fields to your `channels.marmot` config:
+
+```json
+{
+  "channels": {
+    "marmot": {
+      "groupPolicy": "open",
+      "groupAllowFrom": ["<owner-pubkey>", "<friend-pubkey>"],
+      "owner": "<owner-pubkey>",
+      "memberNames": {
+        "<owner-pubkey>": "Alice",
+        "<friend-pubkey>": "Bob"
+      }
+    }
+  }
+}
+```
+
+**Key features:**
+- **Mention gating** — bot only responds when @mentioned, buffers other messages as context
+- **Sender identity** — resolves display names from Nostr profiles (kind:0), with in-memory caching
+- **Owner/friend tiers** — owner gets `CommandAuthorized`, friends can chat but not run commands
+- **Per-group sessions** — each group gets isolated conversation history
+- **Sender metadata** — exposes npub and owner/friend tag for verifiable identity
+
 > **Note:** Setting `sidecarCmd` to just `"marmotd"` (no path) tells the plugin to auto-download the correct prebuilt binary. Binaries are cached at `~/.openclaw/tools/marmot/<version>/marmotd`.
 
 ### 4. Restart OpenClaw gateway
