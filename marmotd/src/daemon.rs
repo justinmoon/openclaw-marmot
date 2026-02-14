@@ -286,9 +286,6 @@ enum CallMediaTransport {
 impl CallMediaTransport {
     fn for_session(params: &CallSessionParams) -> anyhow::Result<Self> {
         if is_real_moq_url(&params.moq_url) {
-            // Important: keep the NetworkRelay alive beyond the lifetime of a single publish call.
-            // Otherwise, the underlying worker thread/runtime can shut down before frames flush to
-            // the wire, causing "publish ok" locally but rx=0 remotely.
             let relay = shared_network_relay(params)?;
             Ok(Self::Network { relay })
         } else {
@@ -317,7 +314,7 @@ impl CallMediaTransport {
     fn subscribe(
         &self,
         track: &TrackAddress,
-    ) -> Result<std::sync::mpsc::Receiver<MediaFrame>, MediaSessionError> {
+    ) -> Result<pika_media::subscription::MediaFrameSubscription, MediaSessionError> {
         match self {
             Self::InMemory { session } => session.subscribe(track),
             Self::Network { relay } => relay.subscribe(track),
@@ -1177,6 +1174,9 @@ fn start_stt_worker_with_relay(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_task = stop.clone();
     let task = tokio::task::spawn_blocking(move || {
+        // Keep the media session alive for as long as the worker runs.
+        // (Even if it is not used directly in this thread.)
+        let _media = media;
         let mut rx_frames = 0u64;
         let mut rx_decrypt_dropped = 0u64;
         let mut ticks = 0u64;
@@ -1272,6 +1272,9 @@ fn start_stt_worker_with_transport(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_task = stop.clone();
     let task = tokio::task::spawn_blocking(move || {
+        // Critical: keep the transport (and thus NetworkRelay + its tokio runtime)
+        // alive for as long as we're consuming frames.
+        let _transport = transport;
         let mut rx_frames = 0u64;
         let mut rx_decrypt_dropped = 0u64;
         let mut ticks = 0u64;
@@ -1403,6 +1406,134 @@ fn start_echo_worker_with_relay(
     });
 
     Ok(EchoWorker { stop, task })
+}
+
+fn start_echo_worker_with_transport(
+    call_id: &str,
+    session: &CallSessionParams,
+    transport: CallMediaTransport,
+    media_crypto: CallMediaCryptoContext,
+    out_tx: mpsc::UnboundedSender<OutMsg>,
+) -> anyhow::Result<EchoWorker> {
+    let Some(track) = call_audio_track_spec(session) else {
+        return Err(anyhow!("call session missing opus audio track"));
+    };
+
+    let publish_track = TrackAddress {
+        broadcast_path: broadcast_path(
+            &session.broadcast_base,
+            &media_crypto.local_participant_label,
+        )
+        .map_err(|e| anyhow!("invalid local broadcast path: {e}"))?,
+        track_name: track.name.clone(),
+    };
+    let subscribe_track = TrackAddress {
+        broadcast_path: broadcast_path(
+            &session.broadcast_base,
+            &media_crypto.peer_participant_label,
+        )
+        .map_err(|e| anyhow!("invalid peer broadcast path: {e}"))?,
+        track_name: track.name.clone(),
+    };
+    tracing::info!(
+        "[echo] publish_path={} subscribe_path={} track={}",
+        publish_track.broadcast_path,
+        subscribe_track.broadcast_path,
+        publish_track.track_name,
+    );
+    let rx = transport
+        .subscribe(&subscribe_track)
+        .context("subscribe peer track for echo")?;
+
+    let call_id = call_id.to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_task = stop.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let codec = OpusCodec;
+        let mut seq = 0u64;
+        let mut tx_frames = 0u64;
+        let mut rx_frames = 0u64;
+        let mut rx_decrypt_dropped = 0u64;
+        let mut ticks = 0u64;
+        while !stop_for_task.load(Ordering::Relaxed) {
+            while let Ok(inbound) = rx.try_recv() {
+                let decrypted = match decrypt_frame(&inbound.payload, &media_crypto.rx_keys) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        rx_decrypt_dropped = rx_decrypt_dropped.saturating_add(1);
+                        warn!(
+                            "[marmotd] echo decrypt failed call_id={} err={err}",
+                            call_id
+                        );
+                        continue;
+                    }
+                };
+                rx_frames = rx_frames.saturating_add(1);
+
+                let pcm = codec.decode_to_pcm_i16(&OpusPacket(decrypted.payload));
+                let packet = codec.encode_pcm_i16(&pcm);
+                let frame_counter = u32::try_from(seq).unwrap_or(u32::MAX);
+                let encrypted = match encrypt_frame(
+                    &packet.0,
+                    &media_crypto.tx_keys,
+                    FrameInfo {
+                        counter: frame_counter,
+                        group_seq: seq,
+                        frame_idx: 0,
+                        keyframe: true,
+                    },
+                ) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        warn!(
+                            "[marmotd] echo encrypt failed call_id={} err={err}",
+                            call_id
+                        );
+                        continue;
+                    }
+                };
+                let frame = MediaFrame {
+                    seq,
+                    timestamp_us: seq.saturating_mul(20_000),
+                    keyframe: true,
+                    payload: encrypted,
+                };
+                if transport.publish(&publish_track, frame).is_ok() {
+                    tx_frames = tx_frames.saturating_add(1);
+                    seq = seq.saturating_add(1);
+                }
+            }
+
+            ticks = ticks.saturating_add(1);
+            if ticks.is_multiple_of(5) {
+                let _ = out_tx.send(OutMsg::CallDebug {
+                    call_id: call_id.clone(),
+                    tx_frames,
+                    rx_frames,
+                    rx_dropped: rx_decrypt_dropped,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+
+    Ok(EchoWorker { stop, task })
+}
+
+fn echo_mode_enabled() -> bool {
+    std::env::var("MARMOT_ECHO_MODE")
+        .map(|v| !v.trim().is_empty() && v.trim() != "0")
+        .unwrap_or(false)
+}
+
+fn start_echo_worker(
+    call_id: &str,
+    session: &CallSessionParams,
+    media_crypto: CallMediaCryptoContext,
+    out_tx: mpsc::UnboundedSender<OutMsg>,
+) -> anyhow::Result<EchoWorker> {
+    let transport = CallMediaTransport::for_session(session)?;
+    start_echo_worker_with_transport(call_id, session, transport, media_crypto, out_tx)
 }
 
 pub async fn run_audio_echo_smoke(frame_count: u64) -> anyhow::Result<AudioEchoSmokeStats> {
@@ -2001,17 +2132,32 @@ pub async fn daemon_main(
                             }
                         }
 
-                        let worker = match start_stt_worker(
-                            &invite.call_id,
-                            &invite.session,
-                            media_crypto.clone(),
-                            out_tx.clone(),
-                            call_evt_tx.clone(),
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                let _ = out_tx.send(out_error(request_id, "runtime_error", format!("{e:#}")));
-                                continue;
+                        let worker = if echo_mode_enabled() {
+                            match start_echo_worker(
+                                &invite.call_id,
+                                &invite.session,
+                                media_crypto.clone(),
+                                out_tx.clone(),
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = out_tx.send(out_error(request_id, "runtime_error", format!("{e:#}")));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            match start_stt_worker(
+                                &invite.call_id,
+                                &invite.session,
+                                media_crypto.clone(),
+                                out_tx.clone(),
+                                call_evt_tx.clone(),
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = out_tx.send(out_error(request_id, "runtime_error", format!("{e:#}")));
+                                    continue;
+                                }
                             }
                         };
 
@@ -2189,12 +2335,21 @@ pub async fn daemon_main(
                 let Some(call_evt) = call_evt else { continue; };
                 match call_evt {
                     CallWorkerEvent::TranscriptFinal { call_id, text } => {
-                        let Some(nostr_group_id) = active_call
-                            .as_ref()
-                            .filter(|c| c.call_id == call_id)
-                            .map(|c| c.nostr_group_id.clone()) else {
+                        // Always surface transcripts to the controller, even if the call has
+                        // already ended (e.g. flush-on-stop can race with call teardown).
+                        let Some(call) = active_call
+                            .as_mut()
+                            .filter(|c| c.call_id == call_id) else {
+                                let _ = out_tx.send(OutMsg::CallTranscriptFinal {
+                                    call_id: call_id.clone(),
+                                    text: text.clone(),
+                                });
                                 continue;
                             };
+                        let nostr_group_id = call.nostr_group_id.clone();
+                        let session = call.session.clone();
+                        let media_crypto = call.media_crypto.clone();
+                        let start_seq = call.next_voice_seq;
 
                         let _ = out_tx.send(OutMsg::CallTranscriptFinal {
                             call_id: call_id.clone(),
@@ -2206,7 +2361,7 @@ pub async fn daemon_main(
                             &mdk,
                             &keys,
                             &nostr_group_id,
-                            text,
+                            text.clone(),
                             "call_transcript_final",
                         )
                         .await
@@ -2215,6 +2370,30 @@ pub async fn daemon_main(
                                 "[marmotd] call transcript publish failed call_id={} group={} err={err:#}",
                                 call_id, nostr_group_id
                             );
+                        }
+
+                        // Publish TTS audio response.
+                        match publish_tts_audio_response(
+                            &session,
+                            &media_crypto,
+                            start_seq,
+                            &text,
+                        ) {
+                            Ok(stats) => {
+                                if let Some(call) = active_call.as_mut().filter(|c| c.call_id == call_id) {
+                                    call.next_voice_seq = stats.next_seq;
+                                }
+                                tracing::info!(
+                                    "[marmotd] tts response published call_id={} frames={}",
+                                    call_id, stats.frames_published
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "[marmotd] tts response failed call_id={} err={err:#}",
+                                    call_id
+                                );
+                            }
                         }
                     }
                 }
