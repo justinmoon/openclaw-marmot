@@ -497,8 +497,7 @@ fn parse_call_signal(content: &str) -> Option<ParsedCallSignal> {
     }
 
     // Debug hint: the content looked like a call signal but didn't parse.
-    if content.contains("pika.call") && content.contains("call.") && content.contains("type")
-    {
+    if content.contains("pika.call") && content.contains("call.") && content.contains("type") {
         warn!(
             "[marmotd] call signal parse failed (unexpected json shape): {}",
             content.chars().take(240).collect::<String>()
@@ -910,6 +909,15 @@ fn publish_pcm_audio_response_with_relay(
         .map_err(|e| anyhow!("invalid local broadcast path: {e}"))?,
         track_name: track.name.clone(),
     };
+    tracing::info!(
+        "[tts] publish init (relay) broadcast_base={} local_label={} peer_label={} publish_path={} track={} start_seq={}",
+        session.broadcast_base,
+        media_crypto.local_participant_label,
+        media_crypto.peer_participant_label,
+        publish_track.broadcast_path,
+        publish_track.track_name,
+        start_seq
+    );
 
     let mono_pcm = downmix_to_mono(&tts_pcm.pcm_i16, tts_pcm.channels);
     let pcm = resample_mono_linear(&mono_pcm, tts_pcm.sample_rate_hz, track.sample_rate);
@@ -992,6 +1000,16 @@ fn publish_tts_audio_response_with_transport(
         .map_err(|e| anyhow!("invalid local broadcast path: {e}"))?,
         track_name: track.name.clone(),
     };
+    tracing::info!(
+        "[tts] publish init (transport) broadcast_base={} local_label={} peer_label={} publish_path={} track={} start_seq={} text_len={}",
+        session.broadcast_base,
+        media_crypto.local_participant_label,
+        media_crypto.peer_participant_label,
+        publish_track.broadcast_path,
+        publish_track.track_name,
+        start_seq,
+        tts_text.len()
+    );
 
     let mono_pcm = downmix_to_mono(&tts_pcm.pcm_i16, tts_pcm.channels);
     let pcm = resample_mono_linear(&mono_pcm, tts_pcm.sample_rate_hz, track.sample_rate);
@@ -1981,6 +1999,17 @@ pub async fn daemon_main(
                             next_voice_seq: 0,
                             worker,
                         });
+                        if let Some(call) = active_call.as_ref() {
+                            tracing::info!(
+                                "[marmotd] call active call_id={} group={} moq_url={} broadcast_base={} local_label={} peer_label={}",
+                                call.call_id,
+                                call.nostr_group_id,
+                                call.session.moq_url,
+                                call.session.broadcast_base,
+                                call.media_crypto.local_participant_label,
+                                call.media_crypto.peer_participant_label
+                            );
+                        }
                         let _ = out_tx.send(out_ok(request_id, Some(json!({
                             "call_id": invite.call_id,
                             "nostr_group_id": invite.nostr_group_id,
@@ -2068,6 +2097,11 @@ pub async fn daemon_main(
                             let _ = out_tx.send(out_error(request_id, "bad_request", "tts_text must not be empty"));
                             continue;
                         }
+                        tracing::info!(
+                            "[marmotd] send_audio_response start call_id={} text_len={}",
+                            call_id,
+                            tts_text.len()
+                        );
                         match publish_tts_audio_response(
                             &current.session,
                             &current.media_crypto,
@@ -2076,6 +2110,12 @@ pub async fn daemon_main(
                         ) {
                             Ok(stats) => {
                                 current.next_voice_seq = stats.next_seq;
+                                tracing::info!(
+                                    "[marmotd] send_audio_response ok call_id={} frames={} next_seq={}",
+                                    call_id,
+                                    stats.frames_published,
+                                    stats.next_seq
+                                );
                                 let _ = out_tx.send(out_ok(
                                     request_id,
                                     Some(json!({
@@ -2085,6 +2125,10 @@ pub async fn daemon_main(
                                 ));
                             }
                             Err(err) => {
+                                warn!(
+                                    "[marmotd] send_audio_response failed call_id={} err={err:#}",
+                                    call_id
+                                );
                                 let _ = out_tx.send(out_error(
                                     request_id,
                                     "runtime_error",
