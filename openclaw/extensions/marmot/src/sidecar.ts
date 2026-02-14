@@ -129,7 +129,19 @@ export class MarmotSidecar {
         for (const ln of s.split(/\r?\n/)) {
           const trimmed = ln.trim();
           if (!trimmed) continue;
-          getMarmotRuntime().logger?.debug(`[marmotd] ${trimmed}`);
+          // Sidecar parse/compat errors are critical for debugging interop, and OpenClaw's
+          // default log level may hide debug output. Escalate likely call-signal errors.
+          const looksLikeCallSignalIssue =
+            trimmed.includes("pika.call") ||
+            trimmed.includes("call.invite") ||
+            trimmed.includes("call.accept") ||
+            trimmed.includes("call signal");
+          const log = getMarmotRuntime().logger;
+          if (looksLikeCallSignalIssue) {
+            log?.warn(`[marmotd] ${trimmed}`);
+          } else {
+            log?.debug(`[marmotd] ${trimmed}`);
+          }
         }
       }
     });
