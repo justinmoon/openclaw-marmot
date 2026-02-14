@@ -602,8 +602,12 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
 
       const isGroupAllowed = (nostrGroupId: string): boolean => {
         if (groupPolicy === "open") return true;
+        // In allowlist mode, a group is allowed if it's explicitly listed in groups config
+        // OR if groupAllowFrom has entries (sender-level filtering handles security)
         const gid = String(nostrGroupId).trim().toLowerCase();
-        return Boolean(allowedGroups[gid]);
+        if (Boolean(allowedGroups[gid])) return true;
+        if (groupAllowFrom.length > 0) return true;
+        return false;
       };
       const isSenderAllowed = (pubkey: string): boolean => {
         if (groupAllowFrom.length === 0) return true;
