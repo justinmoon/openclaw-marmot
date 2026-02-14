@@ -258,7 +258,15 @@ export class MarmotSidecar {
   async sendAudioResponse(
     callId: string,
     ttsText: string,
-  ): Promise<{ call_id: string; frames_published: number }> {
+  ): Promise<{
+    call_id: string;
+    frames_published: number;
+    publish_path?: string;
+    subscribe_path?: string;
+    track?: string;
+    local_label?: string;
+    peer_label?: string;
+  }> {
     const result = await this.request({
       cmd: "send_audio_response",
       call_id: callId,
@@ -268,7 +276,20 @@ export class MarmotSidecar {
     if (typeof framesPublished !== "number" || !Number.isFinite(framesPublished)) {
       throw new Error("unexpected send_audio_response result (missing frames_published)");
     }
-    return { call_id: callId, frames_published: framesPublished };
+    const publishPath = (result as any)?.publish_path;
+    const subscribePath = (result as any)?.subscribe_path;
+    const track = (result as any)?.track;
+    const localLabel = (result as any)?.local_label;
+    const peerLabel = (result as any)?.peer_label;
+    return {
+      call_id: callId,
+      frames_published: framesPublished,
+      publish_path: typeof publishPath === "string" ? publishPath : undefined,
+      subscribe_path: typeof subscribePath === "string" ? subscribePath : undefined,
+      track: typeof track === "string" ? track : undefined,
+      local_label: typeof localLabel === "string" ? localLabel : undefined,
+      peer_label: typeof peerLabel === "string" ? peerLabel : undefined,
+    };
   }
 
   async shutdown(): Promise<void> {

@@ -364,8 +364,9 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
 	              void sidecar
 	                .sendAudioResponse(callId, callStartTtsText)
 	                .then((stats) => {
+	                  const publish = stats.publish_path ? ` publish_path=${stats.publish_path}` : "";
 	                  ctx.log?.info(
-	                    `[${resolved.accountId}] call_start_tts ok call_id=${callId} frames_published=${stats.frames_published}`,
+	                    `[${resolved.accountId}] call_start_tts ok call_id=${callId} frames_published=${stats.frames_published}${publish}`,
 	                  );
 	                })
 	                .catch((err) => {
@@ -420,8 +421,9 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
               text: transcript,
               deliverText: async (responseText: string) => {
                 const stats = await sidecar.sendAudioResponse(ev.call_id, responseText);
+                const publish = stats.publish_path ? ` publish_path=${stats.publish_path}` : "";
                 ctx.log?.info(
-                  `[${resolved.accountId}] call_tts ok call_id=${ev.call_id} frames_published=${stats.frames_published}`,
+                  `[${resolved.accountId}] call_tts ok call_id=${ev.call_id} frames_published=${stats.frames_published}${publish}`,
                 );
               },
               log: ctx.log,
