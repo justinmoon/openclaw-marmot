@@ -101,7 +101,12 @@ export class MarmotSidecar {
   #requestSeq = 0;
   #pending = new Map<
     string,
-    { resolve: (v: unknown) => void; reject: (e: Error) => void; startedAt: number }
+    {
+      cmd: string;
+      resolve: (v: unknown) => void;
+      reject: (e: Error) => void;
+      startedAt: number;
+    }
   >();
   #onEvent: SidecarEventHandler | null = null;
   #readyResolve: ((msg: SidecarOutMsg & { type: "ready" }) => void) | null = null;
@@ -200,9 +205,16 @@ export class MarmotSidecar {
     const line = JSON.stringify(payload);
 
     const startedAt = Date.now();
+    const cmdName = String((cmd as any).cmd ?? "unknown");
+    const logRequests = String(process.env.MARMOT_SIDECAR_LOG_REQUESTS ?? "").trim() === "1";
     const p = new Promise<unknown>((resolve, reject) => {
-      this.#pending.set(requestId, { resolve, reject, startedAt });
+      this.#pending.set(requestId, { cmd: cmdName, resolve, reject, startedAt });
     });
+    if (logRequests) {
+      getMarmotRuntime().logger?.info(
+        `[marmot] sidecar_request_start cmd=${cmdName} request_id=${requestId}`,
+      );
+    }
     this.#proc.stdin.write(`${line}\n`);
     return await p;
   }
@@ -243,8 +255,20 @@ export class MarmotSidecar {
     await this.request({ cmd: "end_call", call_id: callId, reason } as any);
   }
 
-  async sendAudioResponse(callId: string, ttsText: string): Promise<void> {
-    await this.request({ cmd: "send_audio_response", call_id: callId, tts_text: ttsText } as any);
+  async sendAudioResponse(
+    callId: string,
+    ttsText: string,
+  ): Promise<{ call_id: string; frames_published: number }> {
+    const result = await this.request({
+      cmd: "send_audio_response",
+      call_id: callId,
+      tts_text: ttsText,
+    } as any);
+    const framesPublished = (result as any)?.frames_published;
+    if (typeof framesPublished !== "number" || !Number.isFinite(framesPublished)) {
+      throw new Error("unexpected send_audio_response result (missing frames_published)");
+    }
+    return { call_id: callId, frames_published: framesPublished };
   }
 
   async shutdown(): Promise<void> {
@@ -284,9 +308,21 @@ export class MarmotSidecar {
         const pending = this.#pending.get(requestId);
         if (pending) {
           this.#pending.delete(requestId);
+          const logRequests = String(process.env.MARMOT_SIDECAR_LOG_REQUESTS ?? "").trim() === "1";
+          const elapsedMs = Date.now() - pending.startedAt;
           if (msg.type === "ok") {
+            if (logRequests) {
+              getMarmotRuntime().logger?.info(
+                `[marmot] sidecar_request_ok cmd=${pending.cmd} request_id=${requestId} elapsed_ms=${elapsedMs}`,
+              );
+            }
             pending.resolve((msg as any).result ?? null);
           } else {
+            if (logRequests) {
+              getMarmotRuntime().logger?.warn(
+                `[marmot] sidecar_request_error cmd=${pending.cmd} request_id=${requestId} elapsed_ms=${elapsedMs} code=${msg.code} message=${JSON.stringify(msg.message)}`,
+              );
+            }
             pending.reject(new Error(`${msg.code}: ${msg.message}`));
           }
           return;

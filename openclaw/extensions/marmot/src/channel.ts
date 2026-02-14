@@ -361,11 +361,18 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
 	            const callId = ev.call_id;
 	            setTimeout(() => {
 	              // Fire-and-forget: we don't want this to block the event loop.
-	              void sidecar.sendAudioResponse(callId, callStartTtsText).catch((err) => {
-	                ctx.log?.error(
-	                  `[${resolved.accountId}] call_start_tts failed call_id=${callId}: ${err}`,
-	                );
-	              });
+	              void sidecar
+	                .sendAudioResponse(callId, callStartTtsText)
+	                .then((stats) => {
+	                  ctx.log?.info(
+	                    `[${resolved.accountId}] call_start_tts ok call_id=${callId} frames_published=${stats.frames_published}`,
+	                  );
+	                })
+	                .catch((err) => {
+	                  ctx.log?.error(
+	                    `[${resolved.accountId}] call_start_tts failed call_id=${callId}: ${err}`,
+	                  );
+	                });
 	            }, callStartTtsDelayMs);
 	          }
 	          return;
@@ -412,7 +419,10 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
               chatId: callCtx.chatId,
               text: transcript,
               deliverText: async (responseText: string) => {
-                await sidecar.sendAudioResponse(ev.call_id, responseText);
+                const stats = await sidecar.sendAudioResponse(ev.call_id, responseText);
+                ctx.log?.info(
+                  `[${resolved.accountId}] call_tts ok call_id=${ev.call_id} frames_published=${stats.frames_published}`,
+                );
               },
               log: ctx.log,
             });
