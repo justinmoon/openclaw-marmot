@@ -414,6 +414,24 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
             return;
           }
 
+          // Debug: if a call signal fails to parse in the sidecar, it will fall back to
+          // `message_received` and the bot will treat it as plain text. Surface the raw
+          // content (with basic redaction) so we can patch the sidecar parser.
+          //
+          // Note: we key off either explicit `pika.call` markers or "looks like JSON" to avoid
+          // missing shape mismatches (e.g. JSON envelopes without expected substrings).
+          if (
+            typeof ev.content === "string" &&
+            (ev.content.includes("pika.call") ||
+              ev.content.includes("call.invite") ||
+              ev.content.trim().startsWith("{"))
+          ) {
+            const redacted = ev.content.replace(/capv1_[0-9a-f]{64}/gi, "capv1_REDACTED");
+            ctx.log?.warn(
+              `[${resolved.accountId}] debug_message_received group=${ev.nostr_group_id} from=${ev.from_pubkey} content=${JSON.stringify(redacted.slice(0, 800))}`,
+            );
+          }
+
           const e2ePingNonce = parseE2ePingNonce(ev.content) ?? parseLegacyPikaE2eNonce(ev.content);
           if (e2ePingNonce !== null) {
             const ack = `pong:${e2ePingNonce}`;
