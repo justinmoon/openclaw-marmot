@@ -173,6 +173,13 @@ struct IdentityFile {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Both `ring` and `aws-lc-rs` are in the dep tree (nostr-sdk uses ring,
+    // quinn/moq-native uses aws-lc-rs). Rustls cannot auto-select when both
+    // are present, so we explicitly install ring as the default provider.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls CryptoProvider");
+
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
         .with_target(false)
