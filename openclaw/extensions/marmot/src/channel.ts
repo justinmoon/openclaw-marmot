@@ -12,6 +12,8 @@ import {
 } from "./types.js";
 import { MarmotSidecar, resolveAccountStateDir } from "./sidecar.js";
 import { resolveMarmotSidecarCommand } from "./sidecar-install.js";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
 type MarmotSidecarHandle = {
   sidecar: MarmotSidecar;
@@ -233,6 +235,34 @@ function isDmGroup(chatId: string, cfg: any): boolean {
   return dmGroups.some((id: string) => id.toLowerCase() === chatId.toLowerCase());
 }
 
+/**
+ * Query the marmot sqlite DB for distinct member pubkeys in a group.
+ * Returns an array of { pubkey, npub, name } for each member.
+ */
+async function getGroupMembers(
+  nostrGroupId: string,
+  stateDir: string,
+  cfg: any,
+): Promise<Array<{ pubkey: string; npub: string; name: string }>> {
+  try {
+    const dbPath = path.join(stateDir, "mdk.sqlite");
+    // Use the groups table to find the mls_group_id for this nostr_group_id
+    const { execSync } = await import("node:child_process");
+    const query = `SELECT DISTINCT hex(m.pubkey) as pk FROM messages m JOIN groups g ON m.mls_group_id = g.mls_group_id WHERE g.nostr_group_id = x'${nostrGroupId}' ORDER BY pk;`;
+    const result = execSync(`sqlite3 "${dbPath}" "${query}"`, { encoding: "utf-8", timeout: 3000 }).trim();
+    if (!result) return [];
+    const members = result.split("\n").map((hexPk) => {
+      const pk = hexPk.trim().toLowerCase();
+      const npub = hexToNpub(pk);
+      const name = resolveMemberName(pk, cfg);
+      return { pubkey: pk, npub, name };
+    });
+    return members;
+  } catch {
+    return [];
+  }
+}
+
 function resolveRequireMention(chatId: string, cfg: any): boolean {
   // Check channels.marmot.groups config
   const groups = cfg?.channels?.marmot?.groups ?? {};
@@ -265,6 +295,7 @@ async function dispatchInboundToAgent(params: {
   wasMentioned?: boolean;
   inboundHistory?: PendingHistoryEntry[];
   groupName?: string;
+  stateDir?: string;
   deliverText: (text: string) => Promise<void>;
   log?: { error?: (msg: string) => void };
 }): Promise<void> {
@@ -274,6 +305,17 @@ async function dispatchInboundToAgent(params: {
   // DM groups and owner-only 1:1 → main session. Multi-person groups → isolated session.
   const chatType = isGroupChat ? "group" : "dm";
   const senderName = await resolveMemberNameAsync(senderId, cfg);
+
+  // Resolve group members for context (best effort)
+  let groupMembersInfo: string | undefined;
+  if (isGroupChat && params.stateDir) {
+    const members = await getGroupMembers(chatId, params.stateDir, cfg);
+    if (members.length > 0) {
+      groupMembersInfo = members
+        .map((m) => `${m.name} (nostr:${m.npub})`)
+        .join(", ");
+    }
+  }
 
   const ctx = {
     Body: text,
@@ -296,7 +338,7 @@ async function dispatchInboundToAgent(params: {
     WasMentioned: params.wasMentioned ?? !isGroupChat,
     ...(isGroupChat ? {
       GroupSubject: params.groupName || groupNames.get(chatId) || undefined,
-      GroupSystemPrompt: GROUP_SYSTEM_PROMPT,
+      GroupSystemPrompt: GROUP_SYSTEM_PROMPT + (groupMembersInfo ? `\nGroup members: ${groupMembersInfo}\nTo mention someone, use their nostr:npub1... identifier.` : ""),
       InboundHistory: params.inboundHistory,
       ConversationLabel: params.groupName || chatId,
     } : {}),
@@ -687,6 +729,7 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
                 wasMentioned,
                 inboundHistory: pendingHistory.length > 0 ? pendingHistory : undefined,
                 groupName: groupNames.get(groupId),
+                stateDir: baseStateDir,
                 deliverText: async (responseText: string) => {
                   await sidecar.sendMessage(ev.nostr_group_id, responseText);
                 },
