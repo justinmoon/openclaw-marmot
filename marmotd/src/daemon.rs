@@ -376,51 +376,136 @@ enum OutgoingCallSignal<'a> {
 }
 
 fn parse_call_signal(content: &str) -> Option<ParsedCallSignal> {
-    let env: CallSignalEnvelope = serde_json::from_str(content).ok()?;
-    if env.v != 1 || env.ns != "pika.call" {
-        return None;
+    fn from_env(env: CallSignalEnvelope) -> Option<ParsedCallSignal> {
+        if env.v != 1 || env.ns != "pika.call" {
+            return None;
+        }
+        match env.msg_type.as_str() {
+            "call.invite" => {
+                let session: CallSessionParams = match serde_json::from_value(env.body) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(
+                            "[marmotd] call.invite body parse failed call_id={} err={e:#}",
+                            env.call_id
+                        );
+                        return None;
+                    }
+                };
+                Some(ParsedCallSignal::Invite {
+                    call_id: env.call_id,
+                    session,
+                })
+            }
+            "call.accept" => {
+                let session: CallSessionParams = match serde_json::from_value(env.body) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(
+                            "[marmotd] call.accept body parse failed call_id={} err={e:#}",
+                            env.call_id
+                        );
+                        return None;
+                    }
+                };
+                Some(ParsedCallSignal::Accept {
+                    call_id: env.call_id,
+                    session,
+                })
+            }
+            "call.reject" => {
+                let reason = env
+                    .body
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("declined")
+                    .to_string();
+                Some(ParsedCallSignal::Reject {
+                    call_id: env.call_id,
+                    reason,
+                })
+            }
+            "call.end" => {
+                let reason = env
+                    .body
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("remote_end")
+                    .to_string();
+                Some(ParsedCallSignal::End {
+                    call_id: env.call_id,
+                    reason,
+                })
+            }
+            _ => None,
+        }
     }
-    match env.msg_type.as_str() {
-        "call.invite" => {
-            let session: CallSessionParams = serde_json::from_value(env.body).ok()?;
-            Some(ParsedCallSignal::Invite {
-                call_id: env.call_id,
-                session,
-            })
+
+    // Fast path: expected envelope.
+    match serde_json::from_str::<CallSignalEnvelope>(content) {
+        Ok(env) => return from_env(env),
+        Err(e) => {
+            // If this looks like a call signal, surface the parse error.
+            if content.contains("pika.call")
+                || content.contains("call.invite")
+                || content.contains("call.accept")
+            {
+                warn!(
+                    "[marmotd] call signal envelope parse failed err={e:#} content={}",
+                    content.chars().take(240).collect::<String>()
+                );
+            }
         }
-        "call.accept" => {
-            let session: CallSessionParams = serde_json::from_value(env.body).ok()?;
-            Some(ParsedCallSignal::Accept {
-                call_id: env.call_id,
-                session,
-            })
-        }
-        "call.reject" => {
-            let reason = env
-                .body
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("declined")
-                .to_string();
-            Some(ParsedCallSignal::Reject {
-                call_id: env.call_id,
-                reason,
-            })
-        }
-        "call.end" => {
-            let reason = env
-                .body
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("remote_end")
-                .to_string();
-            Some(ParsedCallSignal::End {
-                call_id: env.call_id,
-                reason,
-            })
-        }
-        _ => None,
     }
+
+    // Compat: sometimes the application payload can be JSON-encoded as a string.
+    // Example: "\"{...}\"" (double-encoded).
+    if let Ok(inner) = serde_json::from_str::<String>(content) {
+        let inner_trimmed = inner.trim();
+        if inner_trimmed != content {
+            if let Some(sig) = parse_call_signal(inner_trimmed) {
+                return Some(sig);
+            }
+        }
+    }
+
+    // Compat: unwrap a JSON object with a nested `content` field.
+    // This is useful if the sender serialized the whole rumor/event JSON rather than the plain
+    // rumor content string.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(inner) = v.get("content").and_then(|x| x.as_str()) {
+            let inner_trimmed = inner.trim();
+            if inner_trimmed != content {
+                if let Some(sig) = parse_call_signal(inner_trimmed) {
+                    return Some(sig);
+                }
+            }
+        }
+        // Compat: unwrap common nested shapes.
+        if let Some(inner) = v
+            .get("rumor")
+            .and_then(|r| r.get("content"))
+            .and_then(|x| x.as_str())
+        {
+            let inner_trimmed = inner.trim();
+            if inner_trimmed != content {
+                if let Some(sig) = parse_call_signal(inner_trimmed) {
+                    return Some(sig);
+                }
+            }
+        }
+    }
+
+    // Debug hint: the content looked like a call signal but didn't parse.
+    if content.contains("pika.call") && content.contains("call.") && content.contains("type")
+    {
+        warn!(
+            "[marmotd] call signal parse failed (unexpected json shape): {}",
+            content.chars().take(240).collect::<String>()
+        );
+    }
+
+    None
 }
 
 fn build_call_signal_json(call_id: &str, signal: OutgoingCallSignal<'_>) -> anyhow::Result<String> {
@@ -2270,6 +2355,77 @@ mod tests {
                     session.broadcast_base,
                     "pika/calls/550e8400-e29b-41d4-a716-446655440000"
                 );
+            }
+            other => panic!("expected invite signal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_call_invite_signal_when_double_encoded() {
+        let raw = serde_json::json!({
+            "v": 1,
+            "ns": "pika.call",
+            "type": "call.invite",
+            "call_id": "550e8400-e29b-41d4-a716-446655440000",
+            "ts_ms": 1730000000000i64,
+            "body": {
+                "moq_url": "https://moq.local/anon",
+                "broadcast_base": "pika/calls/550e8400-e29b-41d4-a716-446655440000",
+                "tracks": [{
+                    "name": "audio0",
+                    "codec": "opus",
+                    "sample_rate": 48000,
+                    "channels": 1,
+                    "frame_ms": 20
+                }]
+            }
+        })
+        .to_string();
+
+        // JSON string containing JSON.
+        let content = serde_json::to_string(&raw).expect("double encode");
+        let parsed = parse_call_signal(&content).expect("parse call signal");
+        match parsed {
+            ParsedCallSignal::Invite { call_id, .. } => {
+                assert_eq!(call_id, "550e8400-e29b-41d4-a716-446655440000");
+            }
+            other => panic!("expected invite signal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_call_invite_signal_when_wrapped_in_object_with_content_field() {
+        let inner = serde_json::json!({
+            "v": 1,
+            "ns": "pika.call",
+            "type": "call.invite",
+            "call_id": "550e8400-e29b-41d4-a716-446655440000",
+            "ts_ms": 1730000000000i64,
+            "body": {
+                "moq_url": "https://moq.local/anon",
+                "broadcast_base": "pika/calls/550e8400-e29b-41d4-a716-446655440000",
+                "tracks": [{
+                    "name": "audio0",
+                    "codec": "opus",
+                    "sample_rate": 48000,
+                    "channels": 1,
+                    "frame_ms": 20
+                }]
+            }
+        })
+        .to_string();
+
+        let outer = serde_json::json!({
+            "kind": 9,
+            "content": inner,
+            "id": "deadbeef"
+        })
+        .to_string();
+
+        let parsed = parse_call_signal(&outer).expect("parse call signal");
+        match parsed {
+            ParsedCallSignal::Invite { call_id, .. } => {
+                assert_eq!(call_id, "550e8400-e29b-41d4-a716-446655440000");
             }
             other => panic!("expected invite signal, got {other:?}"),
         }
