@@ -21,6 +21,237 @@ type MarmotSidecarHandle = {
 
 const activeSidecars = new Map<string, MarmotSidecarHandle>();
 
+// Group chat pending history buffer (for context injection when mention-gated)
+type PendingHistoryEntry = { sender: string; body: string; timestamp?: number };
+const groupHistories = new Map<string, PendingHistoryEntry[]>();
+const GROUP_HISTORY_LIMIT = 50;
+
+// Cache group names from welcome events
+const groupNames = new Map<string, string>();
+
+function recordPendingHistory(historyKey: string, entry: PendingHistoryEntry): void {
+  const history = groupHistories.get(historyKey) ?? [];
+  history.push(entry);
+  while (history.length > GROUP_HISTORY_LIMIT) {
+    history.shift();
+  }
+  groupHistories.set(historyKey, history);
+}
+
+function flushPendingHistory(historyKey: string): PendingHistoryEntry[] {
+  const history = groupHistories.get(historyKey) ?? [];
+  groupHistories.set(historyKey, []);
+  return history;
+}
+
+function detectMention(text: string, botPubkey: string, botNpub: string, cfg: any): boolean {
+  const textLower = text.toLowerCase();
+  const pubkeyLower = botPubkey.toLowerCase();
+  const npubLower = botNpub.toLowerCase();
+
+  // Check for nostr:npub mention (Pika/Nostr format)
+  if (npubLower && textLower.includes(`nostr:${npubLower}`)) {
+    return true;
+  }
+  // Check for raw npub mention
+  if (npubLower && textLower.includes(npubLower)) {
+    return true;
+  }
+  // Check for @pubkey or raw pubkey mention (fallback)
+  if (textLower.includes(`@${pubkeyLower}`) || textLower.includes(pubkeyLower)) {
+    return true;
+  }
+  // Check agent mentionPatterns from config (e.g. "kelaode", "@kelaode")
+  try {
+    const runtime = getMarmotRuntime();
+    const mentionRegexes = runtime.channel.mentions.buildMentionRegexes(cfg);
+    if (mentionRegexes.length > 0 && runtime.channel.mentions.matchesMentionPatterns(text, mentionRegexes)) {
+      return true;
+    }
+  } catch {
+    // SDK utilities not available, fall back to pubkey/npub detection
+  }
+  return false;
+}
+
+// --- Bech32 encoder for npub conversion ---
+const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+function bech32Polymod(values: number[]): number {
+  const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  let chk = 1;
+  for (const v of values) {
+    const b = chk >> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) {
+      if ((b >> i) & 1) chk ^= GEN[i];
+    }
+  }
+  return chk;
+}
+
+function bech32HrpExpand(hrp: string): number[] {
+  const ret: number[] = [];
+  for (let i = 0; i < hrp.length; i++) ret.push(hrp.charCodeAt(i) >> 5);
+  ret.push(0);
+  for (let i = 0; i < hrp.length; i++) ret.push(hrp.charCodeAt(i) & 31);
+  return ret;
+}
+
+function bech32CreateChecksum(hrp: string, data: number[]): number[] {
+  const values = bech32HrpExpand(hrp).concat(data).concat([0, 0, 0, 0, 0, 0]);
+  const polymod = bech32Polymod(values) ^ 1;
+  const ret: number[] = [];
+  for (let i = 0; i < 6; i++) ret.push((polymod >> (5 * (5 - i))) & 31);
+  return ret;
+}
+
+function hexToNpub(hex: string): string {
+  const hrp = "npub";
+  // Convert hex to bytes
+  const bytes: number[] = [];
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes.push(parseInt(hex.substring(i, i + 2), 16));
+  }
+  // Convert 8-bit bytes to 5-bit groups
+  const data: number[] = [];
+  let acc = 0;
+  let bits = 0;
+  for (const b of bytes) {
+    acc = (acc << 8) | b;
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      data.push((acc >> bits) & 31);
+    }
+  }
+  if (bits > 0) data.push((acc << (5 - bits)) & 31);
+  const checksum = bech32CreateChecksum(hrp, data);
+  return hrp + "1" + data.concat(checksum).map(d => BECH32_CHARSET[d]).join("");
+}
+
+// --- Nostr profile name cache ---
+interface CachedProfile {
+  name: string | null;
+  fetchedAt: number;
+}
+const profileCache = new Map<string, CachedProfile>();
+const PROFILE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const pendingFetches = new Set<string>();
+
+async function fetchNostrProfileName(pubkeyHex: string, relays: string[]): Promise<string | null> {
+  if (pendingFetches.has(pubkeyHex)) return null;
+  pendingFetches.add(pubkeyHex);
+  try {
+    for (const relay of relays.slice(0, 3)) {
+      try {
+        const wsUrl = relay.replace(/\/$/, "");
+        const result = await new Promise<string | null>((resolve) => {
+          const ws = new WebSocket(wsUrl);
+          const timeout = setTimeout(() => { try { ws.close(); } catch {} resolve(null); }, 5000);
+          ws.addEventListener("open", () => {
+            const subId = "profile_" + pubkeyHex.slice(0, 8);
+            ws.send(JSON.stringify(["REQ", subId, { kinds: [0], authors: [pubkeyHex], limit: 1 }]));
+          });
+          ws.addEventListener("message", (event: any) => {
+            try {
+              const data = typeof event.data === "string" ? event.data : event.data.toString();
+              const msg = JSON.parse(data);
+              if (msg[0] === "EVENT" && msg[2]?.kind === 0) {
+                const meta = JSON.parse(msg[2].content);
+                const displayName = meta.display_name || meta.displayName || meta.name || null;
+                clearTimeout(timeout);
+                try { ws.close(); } catch {}
+                resolve(displayName);
+              } else if (msg[0] === "EOSE") {
+                clearTimeout(timeout);
+                try { ws.close(); } catch {}
+                resolve(null);
+              }
+            } catch { /* ignore parse errors */ }
+          });
+          ws.addEventListener("error", () => { clearTimeout(timeout); try { ws.close(); } catch {} resolve(null); });
+        });
+        if (result) return result;
+      } catch { /* try next relay */ }
+    }
+    return null;
+  } finally {
+    pendingFetches.delete(pubkeyHex);
+  }
+}
+
+function getCachedProfileName(pubkeyHex: string): string | null | undefined {
+  const cached = profileCache.get(pubkeyHex);
+  if (!cached) return undefined; // not cached
+  if (Date.now() - cached.fetchedAt > PROFILE_CACHE_TTL_MS) return undefined; // expired
+  return cached.name;
+}
+
+function resolveMemberName(pubkey: string, cfg: any): string {
+  // Check memberNames config (supports both hex and npub keys)
+  const memberNames = cfg?.channels?.marmot?.memberNames ?? {};
+  const pk = pubkey.toLowerCase();
+  const npub = hexToNpub(pk);
+  for (const [key, name] of Object.entries(memberNames)) {
+    const keyLower = key.toLowerCase();
+    if ((keyLower === pk || keyLower === npub) && typeof name === "string") {
+      return name;
+    }
+  }
+  // Check profile cache (synchronous — returns npub if not cached yet)
+  const cached = getCachedProfileName(pk);
+  if (cached) return cached;
+  // Fall back to npub
+  return npub;
+}
+
+/** Async version: fetches profile from relays if not cached, then caches it */
+async function resolveMemberNameAsync(pubkey: string, cfg: any): Promise<string> {
+  // Check memberNames config first
+  const memberNames = cfg?.channels?.marmot?.memberNames ?? {};
+  const pk = pubkey.toLowerCase();
+  const npub = hexToNpub(pk);
+  for (const [key, name] of Object.entries(memberNames)) {
+    const keyLower = key.toLowerCase();
+    if ((keyLower === pk || keyLower === npub) && typeof name === "string") {
+      return name;
+    }
+  }
+  // Check cache
+  const cached = getCachedProfileName(pk);
+  if (cached !== undefined) return cached || npub;
+  // Fetch from relays
+  const relays: string[] = cfg?.channels?.marmot?.relays ?? [];
+  const profileName = await fetchNostrProfileName(pk, relays);
+  profileCache.set(pk, { name: profileName, fetchedAt: Date.now() });
+  return profileName || npub;
+}
+
+function isDmGroup(chatId: string, cfg: any): boolean {
+  const dmGroups: string[] = cfg?.channels?.marmot?.dmGroups ?? [];
+  return dmGroups.some((id: string) => id.toLowerCase() === chatId.toLowerCase());
+}
+
+function resolveRequireMention(chatId: string, cfg: any): boolean {
+  // Check channels.marmot.groups config
+  const groups = cfg?.channels?.marmot?.groups ?? {};
+  const groupConfig = groups[chatId] ?? groups["*"];
+  if (groupConfig && typeof groupConfig.requireMention === "boolean") {
+    return groupConfig.requireMention;
+  }
+  // Default: require mention in groups
+  return true;
+}
+
+const GROUP_SYSTEM_PROMPT = [
+  "Trust model: You are in a group chat with your owner and their trusted friends.",
+  "Be helpful and engaging with everyone — they are trusted, not strangers.",
+  "Only the owner (CommandAuthorized=true) can run commands or access private information.",
+  "If a friend asks for something sensitive, politely explain the boundary.",
+  "Load GROUP_MEMORY.md for shared context. Never reference MEMORY.md or secrets in groups.",
+].join(" ");
+
 async function dispatchInboundToAgent(params: {
   runtime: ReturnType<typeof getMarmotRuntime>;
   accountId: string;
@@ -28,32 +259,45 @@ async function dispatchInboundToAgent(params: {
   senderId: string;
   text: string;
   isOwner: boolean;
+  isGroupChat: boolean;
+  wasMentioned?: boolean;
+  inboundHistory?: PendingHistoryEntry[];
+  groupName?: string;
   deliverText: (text: string) => Promise<void>;
   log?: { error?: (msg: string) => void };
 }): Promise<void> {
-  const { runtime, accountId, chatId, senderId, text, isOwner, deliverText } = params;
+  const { runtime, accountId, chatId, senderId, text, isOwner, isGroupChat, deliverText } = params;
   const cfg = runtime.config.loadConfig();
 
-  // When the sender is the owner (in groupAllowFrom), treat as a DM so OpenClaw's
-  // core routing collapses it into the agent's main session. We omit SessionKey
-  // so resolveSessionKey() falls through to the main session key for non-group chats.
-  // For non-owner senders, keep the existing group-based session isolation.
-  const chatType = isOwner ? "dm" : "group";
+  // DM groups and owner-only 1:1 → main session. Multi-person groups → isolated session.
+  const chatType = isGroupChat ? "group" : "dm";
+  const senderName = await resolveMemberNameAsync(senderId, cfg);
 
   const ctx = {
     Body: text,
     RawBody: text,
     CommandBody: text,
     BodyForCommands: text,
+    BodyForAgent: text,
     From: senderId,
     To: chatId,
-    ...(isOwner ? {} : { SessionKey: `marmot:${accountId}:${chatId}` }),
+    ...(isGroupChat ? { SessionKey: `marmot:${accountId}:${chatId}` } : {}),
     AccountId: accountId,
     Provider: "marmot",
     Surface: "marmot",
     ChatType: chatType,
     SenderId: senderId,
+    SenderName: senderName,
+    SenderUsername: hexToNpub(senderId.toLowerCase()),
+    SenderTag: isOwner ? "owner" : "friend",
     CommandAuthorized: isOwner,
+    WasMentioned: params.wasMentioned ?? !isGroupChat,
+    ...(isGroupChat ? {
+      GroupSubject: params.groupName || groupNames.get(chatId) || undefined,
+      GroupSystemPrompt: GROUP_SYSTEM_PROMPT,
+      InboundHistory: params.inboundHistory,
+      ConversationLabel: params.groupName || chatId,
+    } : {}),
   } as any;
 
   await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -256,7 +500,7 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
         ["daemon", "--relay", relays[0] ?? "ws://127.0.0.1:18080", "--state-dir", baseStateDir];
 
       ctx.log?.info(
-        `[${resolved.accountId}] starting marmot sidecar cmd=${JSON.stringify(sidecarCmd)} args=${JSON.stringify(sidecarArgs)}`,
+        `[${resolved.accountId}] 🦞 MOLTATHON MARMOT v0.2.0 — starting sidecar cmd=${JSON.stringify(sidecarCmd)} args=${JSON.stringify(sidecarArgs)}`,
       );
 
       const sidecar = new MarmotSidecar({ cmd: sidecarCmd, args: sidecarArgs });
@@ -278,6 +522,16 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
       const groupPolicy = resolved.config.groupPolicy ?? "allowlist";
       const groupAllowFrom =
         (resolved.config.groupAllowFrom ?? []).map((x) => String(x).trim().toLowerCase()).filter(Boolean);
+      // Owner is explicitly configured, or falls back to first entry in groupAllowFrom
+      const ownerPubkeys: string[] =
+        (resolved.config.owner ? (Array.isArray(resolved.config.owner) ? resolved.config.owner : [resolved.config.owner]) : [])
+          .map((x: any) => String(x).trim().toLowerCase())
+          .filter(Boolean);
+      const isOwnerPubkey = (pk: string): boolean => {
+        if (ownerPubkeys.length > 0) return ownerPubkeys.includes(pk);
+        // Legacy fallback: first entry in groupAllowFrom is owner
+        return groupAllowFrom.length > 0 && groupAllowFrom[0] === pk;
+      };
       const allowedGroups = resolved.config.groups ?? {};
 
       const isGroupAllowed = (nostrGroupId: string): boolean => {
@@ -296,12 +550,14 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
           ctx.log?.info(
             `[${resolved.accountId}] welcome_received from=${ev.from_pubkey} group=${ev.nostr_group_id} name=${JSON.stringify(ev.group_name)}`,
           );
+          // Cache group name for later use in GroupSubject
+          if (ev.group_name && ev.nostr_group_id) {
+            groupNames.set(ev.nostr_group_id.toLowerCase(), ev.group_name);
+          }
           if (resolved.config.autoAcceptWelcomes) {
             try {
               await sidecar.acceptWelcome(ev.wrapper_event_id);
             } catch (err) {
-              // This is operationally important: without accepting, we won't subscribe to group
-              // traffic and the bot will appear "dead".
               ctx.log?.error(
                 `[${resolved.accountId}] failed to accept welcome wrapper=${ev.wrapper_event_id}: ${err}`,
               );
@@ -316,6 +572,15 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
           return;
         }
         if (ev.type === "message_received") {
+          // Self-message filter: skip our own messages echoed back
+          const handle = activeSidecars.get(resolved.accountId);
+          if (handle && ev.from_pubkey.toLowerCase() === handle.pubkey.toLowerCase()) {
+            ctx.log?.debug(
+              `[${resolved.accountId}] skip self-message group=${ev.nostr_group_id}`,
+            );
+            return;
+          }
+
           if (!isGroupAllowed(ev.nostr_group_id)) {
             ctx.log?.debug(
               `[${resolved.accountId}] drop message (group not allowed) group=${ev.nostr_group_id}`,
@@ -347,19 +612,73 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
 
           try {
             const senderPk = String(ev.from_pubkey).trim().toLowerCase();
-            const senderIsOwner = groupAllowFrom.length > 0 && groupAllowFrom.includes(senderPk);
-            await dispatchInboundToAgent({
-              runtime,
-              accountId: resolved.accountId,
-              senderId: ev.from_pubkey,
-              chatId: ev.nostr_group_id,
-              text: ev.content,
-              isOwner: senderIsOwner,
-              deliverText: async (responseText: string) => {
-                await sidecar.sendMessage(ev.nostr_group_id, responseText);
-              },
-              log: ctx.log,
-            });
+            const senderIsOwner = isOwnerPubkey(senderPk);
+            const currentCfg = runtime.config.loadConfig();
+            const groupId = ev.nostr_group_id.toLowerCase();
+            const historyKey = `marmot:${resolved.accountId}:${groupId}`;
+
+            // Determine if this is a DM group (1:1 with bot)
+            const isDm = isDmGroup(groupId, currentCfg);
+            // Multi-person groups use group flow (even for owners); DM groups route to main session
+            const isGroupChat = !isDm;
+
+            if (isGroupChat) {
+              // GROUP CHAT FLOW — mention gating + history buffering
+              const requireMention = resolveRequireMention(groupId, currentCfg);
+              const wasMentioned = handle ? detectMention(ev.content, handle.pubkey, handle.npub, currentCfg) : false;
+              const senderName = await resolveMemberNameAsync(senderPk, currentCfg);
+
+              if (requireMention && !wasMentioned) {
+                // Not mentioned — buffer for context, don't dispatch
+                recordPendingHistory(historyKey, {
+                  sender: senderName,
+                  body: ev.content,
+                  timestamp: ev.created_at ? ev.created_at * 1000 : Date.now(),
+                });
+                ctx.log?.debug(
+                  `[${resolved.accountId}] group message buffered (no mention) group=${ev.nostr_group_id} from=${senderPk}`,
+                );
+                return;
+              }
+
+              // Mentioned (or mention not required) — dispatch with pending history
+              const pendingHistory = flushPendingHistory(historyKey);
+              ctx.log?.info(
+                `[${resolved.accountId}] group message dispatching (mentioned=${wasMentioned}) group=${ev.nostr_group_id} from=${senderPk} pendingHistory=${pendingHistory.length}`,
+              );
+
+              await dispatchInboundToAgent({
+                runtime,
+                accountId: resolved.accountId,
+                senderId: ev.from_pubkey,
+                chatId: ev.nostr_group_id,
+                text: ev.content,
+                isOwner: senderIsOwner,
+                isGroupChat: true,
+                wasMentioned,
+                inboundHistory: pendingHistory.length > 0 ? pendingHistory : undefined,
+                groupName: groupNames.get(groupId),
+                deliverText: async (responseText: string) => {
+                  await sidecar.sendMessage(ev.nostr_group_id, responseText);
+                },
+                log: ctx.log,
+              });
+            } else {
+              // DM / OWNER FLOW — route to main session (existing behavior)
+              await dispatchInboundToAgent({
+                runtime,
+                accountId: resolved.accountId,
+                senderId: ev.from_pubkey,
+                chatId: ev.nostr_group_id,
+                text: ev.content,
+                isOwner: senderIsOwner,
+                isGroupChat: false,
+                deliverText: async (responseText: string) => {
+                  await sidecar.sendMessage(ev.nostr_group_id, responseText);
+                },
+                log: ctx.log,
+              });
+            }
           } catch (err) {
             ctx.log?.error(
               `[${resolved.accountId}] dispatchInboundToAgent failed: ${err}`,
