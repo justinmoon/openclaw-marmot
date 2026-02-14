@@ -1,6 +1,6 @@
 {
   "name": "@justinmoon/marmot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenClaw Marmot channel plugin (Rust sidecar)",
   "type": "module",
   "publishConfig": {
