@@ -893,7 +893,11 @@ fn publish_tts_audio_response_with_relay(
     start_seq: u64,
     tts_text: &str,
 ) -> anyhow::Result<VoicePublishStats> {
-    let tts_pcm = synthesize_tts_pcm(tts_text).context("synthesize call tts")?;
+    let text = tts_text.to_string();
+    let tts_pcm = std::thread::spawn(move || synthesize_tts_pcm(&text))
+        .join()
+        .map_err(|_| anyhow!("tts synthesis thread panicked"))?
+        .context("synthesize call tts")?;
     publish_pcm_audio_response_with_relay(session, relay, media_crypto, start_seq, tts_pcm)
 }
 
@@ -1001,7 +1005,13 @@ fn publish_tts_audio_response_with_transport(
     start_seq: u64,
     tts_text: &str,
 ) -> anyhow::Result<VoicePublishStats> {
-    let tts_pcm = synthesize_tts_pcm(tts_text).context("synthesize call tts")?;
+    // synthesize_tts_pcm uses reqwest::blocking::Client which panics if created
+    // inside a tokio runtime. Run it on a dedicated thread.
+    let text = tts_text.to_string();
+    let tts_pcm = std::thread::spawn(move || synthesize_tts_pcm(&text))
+        .join()
+        .map_err(|_| anyhow!("tts synthesis thread panicked"))?
+        .context("synthesize call tts")?;
 
     let Some(track) = call_audio_track_spec(session) else {
         return Err(anyhow!("call session missing opus audio track"));
@@ -1261,13 +1271,8 @@ fn start_stt_worker_with_transport(
         .subscribe(&subscribe_track)
         .context("subscribe peer track for stt (network)")?;
 
-    let mut pipeline = OpusToTranscriptPipeline::new(
-        track.sample_rate,
-        track.channels,
-        transcriber_from_env().context("initialize stt transcriber")?,
-    )
-    .context("initialize stt pipeline")?;
-
+    let sample_rate = track.sample_rate;
+    let channels = track.channels;
     let call_id = call_id.to_string();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_task = stop.clone();
@@ -1275,6 +1280,27 @@ fn start_stt_worker_with_transport(
         // Critical: keep the transport (and thus NetworkRelay + its tokio runtime)
         // alive for as long as we're consuming frames.
         let _transport = transport;
+
+        // Build the STT pipeline here (inside spawn_blocking) because
+        // reqwest::blocking::Client panics when created inside a tokio runtime.
+        let mut pipeline = match OpusToTranscriptPipeline::new(
+            sample_rate,
+            channels,
+            match transcriber_from_env() {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("[stt] transcriber init failed: {e:#}");
+                    return;
+                }
+            },
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("[stt] pipeline init failed: {e:#}");
+                return;
+            }
+        };
+
         let mut rx_frames = 0u64;
         let mut rx_decrypt_dropped = 0u64;
         let mut ticks = 0u64;

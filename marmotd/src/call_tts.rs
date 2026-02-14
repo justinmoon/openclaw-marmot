@@ -79,35 +79,75 @@ pub fn synthesize_tts_pcm(text: &str) -> anyhow::Result<TtsPcm> {
 }
 
 fn decode_wav_pcm(bytes: &[u8]) -> anyhow::Result<TtsPcm> {
-    let mut reader =
-        hound::WavReader::new(Cursor::new(bytes.to_vec())).context("decode tts wav bytes")?;
-    let spec = reader.spec();
-    if spec.channels == 0 {
-        return Err(anyhow!("tts wav has zero channels"));
-    }
-
-    let pcm_i16 = match (spec.sample_format, spec.bits_per_sample) {
-        (hound::SampleFormat::Int, 16) => reader
-            .samples::<i16>()
-            .collect::<Result<Vec<_>, _>>()
-            .context("read 16-bit wav samples")?,
-        (hound::SampleFormat::Float, 32) => {
-            let mut out = Vec::new();
-            for sample in reader.samples::<f32>() {
-                let s = sample.context("read 32-bit float wav sample")?;
-                out.push((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+    // Try hound first; fall back to manual parsing for streaming WAVs
+    // (OpenAI TTS sets data_chunk_size to 0xFFFFFFFF).
+    match hound::WavReader::new(Cursor::new(bytes.to_vec())) {
+        Ok(mut reader) => {
+            let spec = reader.spec();
+            if spec.channels == 0 {
+                return Err(anyhow!("tts wav has zero channels"));
             }
-            out
+            let pcm_i16 = match (spec.sample_format, spec.bits_per_sample) {
+                (hound::SampleFormat::Int, 16) => reader
+                    .samples::<i16>()
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("read 16-bit wav samples")?,
+                (hound::SampleFormat::Float, 32) => {
+                    let mut out = Vec::new();
+                    for sample in reader.samples::<f32>() {
+                        let s = sample.context("read 32-bit float wav sample")?;
+                        out.push((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+                    }
+                    out
+                }
+                (fmt, bits) => {
+                    return Err(anyhow!(
+                        "unsupported tts wav format sample_format={fmt:?} bits_per_sample={bits}"
+                    ));
+                }
+            };
+            Ok(TtsPcm {
+                sample_rate_hz: spec.sample_rate,
+                channels: spec.channels,
+                pcm_i16,
+            })
         }
-        (fmt, bits) => {
-            return Err(anyhow!(
-                "unsupported tts wav format sample_format={fmt:?} bits_per_sample={bits}"
-            ));
-        }
-    };
+        Err(_) => decode_wav_pcm_manual(bytes),
+    }
+}
+
+/// Manual WAV parser for streaming WAVs with invalid chunk sizes.
+fn decode_wav_pcm_manual(bytes: &[u8]) -> anyhow::Result<TtsPcm> {
+    if bytes.len() < 44 {
+        return Err(anyhow!("wav too short ({} bytes)", bytes.len()));
+    }
+    let fmt_pos = bytes
+        .windows(4)
+        .position(|w| w == b"fmt ")
+        .context("no fmt chunk")?;
+    let h = fmt_pos + 8;
+    if bytes.len() < h + 16 {
+        return Err(anyhow!("fmt chunk too short"));
+    }
+    let channels = u16::from_le_bytes([bytes[h + 2], bytes[h + 3]]);
+    let sample_rate = u32::from_le_bytes(bytes[h + 4..h + 8].try_into()?);
+    let bits = u16::from_le_bytes([bytes[h + 14], bytes[h + 15]]);
+    if bits != 16 || channels == 0 {
+        return Err(anyhow!("unsupported wav: bits={bits} channels={channels}"));
+    }
+    let data_pos = bytes
+        .windows(4)
+        .position(|w| w == b"data")
+        .context("no data chunk")?;
+    let pcm_start = data_pos + 8;
+    let pcm_bytes = &bytes[pcm_start..];
+    let pcm_i16: Vec<i16> = pcm_bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
     Ok(TtsPcm {
-        sample_rate_hz: spec.sample_rate,
-        channels: spec.channels,
+        sample_rate_hz: sample_rate,
+        channels,
         pcm_i16,
     })
 }
