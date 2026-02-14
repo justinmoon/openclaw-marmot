@@ -288,6 +288,8 @@ async function dispatchInboundToAgent(params: {
     ChatType: chatType,
     SenderId: senderId,
     SenderName: senderName,
+    SenderUsername: hexToNpub(senderId.toLowerCase()),
+    SenderTag: isOwner ? "owner" : "friend",
     CommandAuthorized: isOwner,
     WasMentioned: params.wasMentioned ?? !isGroupChat,
     ...(isGroupChat ? {
