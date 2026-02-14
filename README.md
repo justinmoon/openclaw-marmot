@@ -19,7 +19,7 @@ Use Marmot as an [OpenClaw](https://openclaw.dev) channel plugin so your AI agen
 ### 1. Install the plugin
 
 ```bash
-openclaw plugins install @justinmoon/openclaw-marmot
+openclaw plugins install @justinmoon/marmot
 ```
 
 This installs the plugin via npm. The `marmotd` sidecar binary is auto-downloaded on first launch (Linux and macOS, x64 and arm64).
