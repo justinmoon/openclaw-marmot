@@ -234,7 +234,7 @@ function isDmGroup(chatId: string, cfg: any): boolean {
 }
 
 function resolveRequireMention(chatId: string, cfg: any): boolean {
-  // Check channels.marmot.groups config
+  // Check channels.marmotclaw.groups config
   const groups = cfg?.channels?.marmot?.groups ?? {};
   const groupConfig = groups[chatId] ?? groups["*"];
   if (groupConfig && typeof groupConfig.requireMention === "boolean") {
@@ -283,8 +283,8 @@ async function dispatchInboundToAgent(params: {
     To: chatId,
     ...(isGroupChat ? { SessionKey: `marmot:${accountId}:${chatId}` } : {}),
     AccountId: accountId,
-    Provider: "marmot",
-    Surface: "marmot",
+    Provider: "marmotclaw",
+    Surface: "marmotclaw",
     ChatType: chatType,
     SenderId: senderId,
     SenderName: senderName,
@@ -380,13 +380,13 @@ function resolveSidecarArgs(cfgArgs?: string[] | null): string[] | null {
 }
 
 export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
-  id: "marmot",
+  id: "marmotclaw",
   meta: {
-    id: "marmot",
+    id: "marmotclaw",
     label: "Marmot",
     selectionLabel: "Marmot (Rust)",
     docsPath: "/channels/marmot",
-    docsLabel: "marmot",
+    docsLabel: "marmotclaw",
     blurb: "MLS E2EE groups over Nostr (Rust sidecar).",
     order: 56,
     quickstartAllowFrom: true,
@@ -396,7 +396,7 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
     media: false,
     nativeCommands: false,
   },
-  reload: { configPrefixes: ["channels.marmot", "plugins.entries.marmot"] },
+  reload: { configPrefixes: ["channels.marmotclaw", "plugins.entries.marmotclaw"] },
 
   config: {
     listAccountIds: (cfg) => listMarmotAccountIds(cfg),
@@ -435,9 +435,9 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
     resolveDmPolicy: () => ({
       policy: "pairing",
       allowFrom: [],
-      policyPath: "channels.marmot.dmPolicy",
-      allowFromPath: "channels.marmot.allowFrom",
-      approveHint: formatPairingApproveHint("marmot"),
+      policyPath: "channels.marmotclaw.dmPolicy",
+      allowFromPath: "channels.marmotclaw.allowFrom",
+      approveHint: formatPairingApproveHint("marmotclaw"),
       normalizeEntry: (raw) => raw.replace(/^marmot:/i, "").trim().toLowerCase(),
     }),
   },
@@ -464,7 +464,7 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
         throw new Error(`invalid marmot group id: ${to}`);
       }
       await handle.sidecar.sendMessage(groupId, text ?? "");
-      return { channel: "marmot", to: groupId };
+      return { channel: "marmotclaw", to: groupId };
     },
     sendMedia: async () => {
       throw new Error("marmot does not support media");
@@ -482,7 +482,7 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
         throw new Error("marmot account disabled");
       }
       if (!resolved.configured) {
-        throw new Error("marmot relays not configured (channels.marmot.relays)");
+        throw new Error("marmot relays not configured (channels.marmotclaw.relays)");
       }
 
       const relays = resolved.config.relays.map((r) => String(r).trim()).filter(Boolean);

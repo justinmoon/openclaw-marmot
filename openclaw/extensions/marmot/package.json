@@ -1,5 +1,5 @@
 {
-  "name": "@justinmoon/openclaw-marmot",
+  "name": "@justinmoon/marmotclaw",
   "version": "0.0.0",
   "description": "OpenClaw Marmot channel plugin (Rust sidecar)",
   "type": "module",
@@ -14,17 +14,17 @@
       "./index.ts"
     ],
     "channel": {
-      "id": "marmot",
+      "id": "marmotclaw",
       "label": "Marmot",
       "selectionLabel": "Marmot (Rust)",
       "docsPath": "/channels/marmot",
-      "docsLabel": "marmot",
+      "docsLabel": "marmotclaw",
       "blurb": "MLS E2EE groups over Nostr (Rust sidecar).",
       "order": 56,
       "quickstartAllowFrom": true
     },
     "install": {
-      "npmSpec": "@justinmoon/openclaw-marmot",
+      "npmSpec": "@justinmoon/marmotclaw",
       "localPath": "extensions/marmot",
       "defaultChoice": "path"
     }

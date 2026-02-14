@@ -1,6 +1,6 @@
 {
-  "id": "marmot",
-  "channels": ["marmot"],
+  "id": "marmotclaw",
+  "channels": ["marmotclaw"],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

@@ -20,7 +20,7 @@ The Marmot plugin supports multi-participant MLS group chats over Nostr. Your bo
 ```json
 {
   "channels": {
-    "marmot": {
+    "marmotclaw": {
       "relays": ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"],
       "sidecarCmd": "marmotd",
       "stateDir": "~/.openclaw/.marmot-state",
@@ -65,7 +65,7 @@ Per-group settings:
 ```json
 {
   "channels": {
-    "marmot": {
+    "marmotclaw": {
       "groups": {
         "*": { "requireMention": true },
         "<specific-group-id>": { "requireMention": false }

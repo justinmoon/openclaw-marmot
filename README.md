@@ -19,7 +19,7 @@ Use Marmot as an [OpenClaw](https://openclaw.dev) channel plugin so your AI agen
 ### 1. Install the plugin
 
 ```bash
-openclaw plugins install @justinmoon/openclaw-marmot
+openclaw plugins install @justinmoon/marmotclaw
 ```
 
 This installs the plugin via npm. The `marmotd` sidecar binary is auto-downloaded on first launch (Linux and macOS, x64 and arm64).
@@ -56,7 +56,7 @@ Add the channel config to `~/.openclaw/openclaw.json`:
 ```json
 {
   "channels": {
-    "marmot": {
+    "marmotclaw": {
       "relays": ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"],
       "sidecarCmd": "marmotd",
       "stateDir": "~/.openclaw/.marmot-state",
@@ -79,7 +79,7 @@ Quick setup for group chats — add these fields to your `channels.marmot` confi
 ```json
 {
   "channels": {
-    "marmot": {
+    "marmotclaw": {
       "groupPolicy": "open",
       "groupAllowFrom": ["<owner-pubkey>", "<friend-pubkey>"],
       "owner": "<owner-pubkey>",
