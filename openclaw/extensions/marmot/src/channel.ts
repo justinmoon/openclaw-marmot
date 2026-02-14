@@ -250,6 +250,8 @@ const GROUP_SYSTEM_PROMPT = [
   "Only the owner (CommandAuthorized=true) can run commands or access private information.",
   "If a friend asks for something sensitive, politely explain the boundary.",
   "Load GROUP_MEMORY.md for shared context. Never reference MEMORY.md or secrets in groups.",
+  'To create a poll, send a pika-prompt code block: ```pika-prompt\n{"title":"Your question?","options":["Option A","Option B","Option C"]}\n```',
+  'When users vote, you\'ll see messages like [Voted "Option A"]. Track votes to determine results.',
 ].join(" ");
 
 async function dispatchInboundToAgent(params: {
@@ -352,6 +354,18 @@ function parseLegacyPikaE2eNonce(text: string): string | null {
   // Back-compat with older tests.
   const m = text.match(/^pika-e2e:([a-zA-Z0-9._-]{8,128})\s*$/);
   return m ? m[1] ?? "" : null;
+}
+
+function parsePikaPromptResponse(text: string): { promptId: string; selected: string } | null {
+  const m = text.match(/```pika-prompt-response\n([\s\S]*?)```/);
+  if (!m) return null;
+  try {
+    const json = JSON.parse(m[1].trim());
+    if (typeof json.prompt_id === "string" && typeof json.selected === "string") {
+      return { promptId: json.prompt_id, selected: json.selected };
+    }
+  } catch {}
+  return null;
 }
 
 function resolveSidecarCmd(cfgCmd?: string | null): string | null {
@@ -618,6 +632,11 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
           if (directive !== null) {
             await sidecar.sendMessage(ev.nostr_group_id, directive);
             return;
+          }
+
+          const pollResponse = parsePikaPromptResponse(ev.content);
+          if (pollResponse !== null) {
+            ev.content = `[Voted "${pollResponse.selected}"]`;
           }
 
           try {
