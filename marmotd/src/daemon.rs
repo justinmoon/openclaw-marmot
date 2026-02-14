@@ -239,6 +239,11 @@ fn call_relay_pool() -> &'static Mutex<HashMap<String, InMemoryRelay>> {
     RELAYS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn network_relay_pool() -> &'static Mutex<HashMap<String, NetworkRelay>> {
+    static RELAYS: OnceLock<Mutex<HashMap<String, NetworkRelay>>> = OnceLock::new();
+    RELAYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn relay_key(params: &CallSessionParams) -> String {
     format!("{}|{}", params.moq_url, params.broadcast_base)
 }
@@ -246,6 +251,26 @@ fn relay_key(params: &CallSessionParams) -> String {
 fn shared_call_relay(params: &CallSessionParams) -> InMemoryRelay {
     let mut relays = call_relay_pool().lock().expect("call relay pool poisoned");
     relays.entry(relay_key(params)).or_default().clone()
+}
+
+fn shared_network_relay(params: &CallSessionParams) -> anyhow::Result<NetworkRelay> {
+    let mut relays = network_relay_pool()
+        .lock()
+        .expect("network relay pool poisoned");
+    // Key by moq_url only; a single relay connection can handle multiple broadcast paths.
+    let relay = match relays.get(&params.moq_url) {
+        Some(r) => r.clone(),
+        None => {
+            let r = NetworkRelay::new(&params.moq_url)
+                .map_err(|e| anyhow!("network relay init: {e}"))?;
+            relays.insert(params.moq_url.clone(), r.clone());
+            r
+        }
+    };
+    relay
+        .connect()
+        .map_err(|e| anyhow!("network relay connect: {e}"))?;
+    Ok(relay)
 }
 
 fn is_real_moq_url(url: &str) -> bool {
@@ -261,11 +286,10 @@ enum CallMediaTransport {
 impl CallMediaTransport {
     fn for_session(params: &CallSessionParams) -> anyhow::Result<Self> {
         if is_real_moq_url(&params.moq_url) {
-            let relay = NetworkRelay::new(&params.moq_url)
-                .map_err(|e| anyhow!("network relay init: {e}"))?;
-            relay
-                .connect()
-                .map_err(|e| anyhow!("network relay connect: {e}"))?;
+            // Important: keep the NetworkRelay alive beyond the lifetime of a single publish call.
+            // Otherwise, the underlying worker thread/runtime can shut down before frames flush to
+            // the wire, causing "publish ok" locally but rx=0 remotely.
+            let relay = shared_network_relay(params)?;
             Ok(Self::Network { relay })
         } else {
             let im_relay = shared_call_relay(params);
