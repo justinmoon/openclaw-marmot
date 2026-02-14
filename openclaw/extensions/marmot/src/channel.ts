@@ -281,6 +281,14 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
 	      const allowedGroups = resolved.config.groups ?? {};
 	      const activeCalls = new Map<string, { chatId: string; senderId: string }>();
 	      const callStartTtsText = String(process.env.MARMOT_CALL_START_TTS_TEXT ?? "").trim();
+	      const callStartTtsDelayMs = (() => {
+	        const raw = String(process.env.MARMOT_CALL_START_TTS_DELAY_MS ?? "").trim();
+	        if (!raw) return 1500;
+	        const n = Number(raw);
+	        if (!Number.isFinite(n)) return 1500;
+	        // Clamp: avoid footguns.
+	        return Math.max(0, Math.min(30_000, Math.floor(n)));
+	      })();
 
       const isGroupAllowed = (nostrGroupId: string): boolean => {
         if (groupPolicy === "open") return true;
@@ -348,15 +356,17 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
 	          );
 	          if (callStartTtsText) {
 	            ctx.log?.info(
-	              `[${resolved.accountId}] call_start_tts call_id=${ev.call_id} text=${JSON.stringify(callStartTtsText)}`,
+	              `[${resolved.accountId}] call_start_tts scheduled call_id=${ev.call_id} delay_ms=${callStartTtsDelayMs} text=${JSON.stringify(callStartTtsText)}`,
 	            );
-	            try {
-	              await sidecar.sendAudioResponse(ev.call_id, callStartTtsText);
-	            } catch (err) {
-	              ctx.log?.error(
-	                `[${resolved.accountId}] call_start_tts failed call_id=${ev.call_id}: ${err}`,
-	              );
-	            }
+	            const callId = ev.call_id;
+	            setTimeout(() => {
+	              // Fire-and-forget: we don't want this to block the event loop.
+	              void sidecar.sendAudioResponse(callId, callStartTtsText).catch((err) => {
+	                ctx.log?.error(
+	                  `[${resolved.accountId}] call_start_tts failed call_id=${callId}: ${err}`,
+	                );
+	              });
+	            }, callStartTtsDelayMs);
 	          }
 	          return;
 	        }
