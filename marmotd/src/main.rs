@@ -14,6 +14,7 @@ use tokio::time::Instant;
 use tracing::{Level, info, warn};
 
 mod call_stt;
+mod call_tts;
 mod daemon;
 
 #[derive(Debug, Parser)]
