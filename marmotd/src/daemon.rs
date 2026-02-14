@@ -9,7 +9,8 @@ use mdk_core::prelude::*;
 use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::prelude::*;
 use pika_media::codec_opus::{OpusCodec, OpusPacket};
-use pika_media::session::{InMemoryRelay, MediaFrame, MediaSession, SessionConfig};
+use pika_media::network::NetworkRelay;
+use pika_media::session::{InMemoryRelay, MediaFrame, MediaSession, MediaSessionError, SessionConfig};
 use pika_media::tracks::{TrackAddress, broadcast_path};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -19,6 +20,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::call_stt::{OpusToTranscriptPipeline, transcriber_from_env};
+use crate::call_tts::synthesize_tts_pcm;
 
 const PROTOCOL_VERSION: u32 = 1;
 
@@ -73,6 +75,12 @@ enum InCmd {
         call_id: String,
         #[serde(default = "default_end_reason")]
         reason: String,
+    },
+    SendAudioResponse {
+        #[serde(default)]
+        request_id: Option<String>,
+        call_id: String,
+        tts_text: String,
     },
     Shutdown {
         #[serde(default)]
@@ -159,6 +167,8 @@ fn default_end_reason() -> String {
 struct CallSessionParams {
     moq_url: String,
     broadcast_base: String,
+    #[serde(default)]
+    relay_auth: String,
     tracks: Vec<CallTrackSpec>,
 }
 
@@ -183,6 +193,8 @@ struct PendingCallInvite {
 struct ActiveEchoCall {
     call_id: String,
     nostr_group_id: String,
+    session: CallSessionParams,
+    next_voice_seq: u64,
     worker: EchoWorker,
 }
 
@@ -218,10 +230,69 @@ fn shared_call_relay(params: &CallSessionParams) -> InMemoryRelay {
     relays.entry(relay_key(params)).or_default().clone()
 }
 
+fn is_real_moq_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+#[derive(Clone)]
+enum CallMediaTransport {
+    InMemory { session: MediaSession },
+    Network { relay: NetworkRelay },
+}
+
+impl CallMediaTransport {
+    fn for_session(params: &CallSessionParams) -> anyhow::Result<Self> {
+        if is_real_moq_url(&params.moq_url) {
+            let relay = NetworkRelay::new(&params.moq_url)
+                .map_err(|e| anyhow!("network relay init: {e}"))?;
+            relay.connect().map_err(|e| anyhow!("network relay connect: {e}"))?;
+            Ok(Self::Network { relay })
+        } else {
+            let im_relay = shared_call_relay(params);
+            let mut session = MediaSession::with_relay(
+                SessionConfig {
+                    moq_url: params.moq_url.clone(),
+                    relay_auth: params.relay_auth.clone(),
+                },
+                im_relay,
+            );
+            session.connect().map_err(|e| anyhow!("in-memory connect: {e}"))?;
+            Ok(Self::InMemory { session })
+        }
+    }
+
+    fn from_in_memory_relay(params: &CallSessionParams, relay: InMemoryRelay) -> anyhow::Result<Self> {
+        let mut session = MediaSession::with_relay(
+            SessionConfig {
+                moq_url: params.moq_url.clone(),
+                relay_auth: params.relay_auth.clone(),
+            },
+            relay,
+        );
+        session.connect().map_err(|e| anyhow!("in-memory connect: {e}"))?;
+        Ok(Self::InMemory { session })
+    }
+
+    fn publish(&self, track: &TrackAddress, frame: MediaFrame) -> Result<usize, MediaSessionError> {
+        match self {
+            Self::InMemory { session } => session.publish(track, frame),
+            Self::Network { relay } => relay.publish(track, frame),
+        }
+    }
+
+    fn subscribe(&self, track: &TrackAddress) -> Result<std::sync::mpsc::Receiver<MediaFrame>, MediaSessionError> {
+        match self {
+            Self::InMemory { session } => session.subscribe(track),
+            Self::Network { relay } => relay.subscribe(track),
+        }
+    }
+}
+
 fn default_audio_call_session(call_id: &str) -> CallSessionParams {
     CallSessionParams {
-        moq_url: "https://moq.local/anon".to_string(),
+        moq_url: "https://moq.justinmoon.com/anon".to_string(),
         broadcast_base: format!("pika/calls/{call_id}"),
+        relay_auth: "capv1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         tracks: vec![CallTrackSpec {
             name: "audio0".to_string(),
             codec: "opus".to_string(),
@@ -443,6 +514,202 @@ fn call_audio_track_spec(session: &CallSessionParams) -> Option<&CallTrackSpec> 
         .find(|t| t.codec.eq_ignore_ascii_case("opus") && t.channels > 0 && t.sample_rate > 0)
 }
 
+fn downmix_to_mono(pcm: &[i16], channels: u16) -> Vec<i16> {
+    if channels <= 1 {
+        return pcm.to_vec();
+    }
+    let channels = channels as usize;
+    let mut out = Vec::with_capacity(pcm.len() / channels.max(1));
+    for frame in pcm.chunks(channels.max(1)) {
+        let sum: i32 = frame.iter().map(|s| *s as i32).sum();
+        out.push((sum / frame.len().max(1) as i32) as i16);
+    }
+    out
+}
+
+fn resample_mono_linear(input: &[i16], in_rate: u32, out_rate: u32) -> Vec<i16> {
+    if input.is_empty() || in_rate == out_rate {
+        return input.to_vec();
+    }
+    let out_len =
+        ((input.len() as u64).saturating_mul(out_rate as u64) / (in_rate as u64).max(1)) as usize;
+    if out_len == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(out_len);
+    for out_idx in 0..out_len {
+        let pos_num = (out_idx as u64).saturating_mul(in_rate as u64);
+        let idx = (pos_num / out_rate as u64) as usize;
+        let frac = (pos_num % out_rate as u64) as f32 / out_rate as f32;
+        let s0 = input[idx.min(input.len().saturating_sub(1))] as f32;
+        let s1 = input[(idx + 1).min(input.len().saturating_sub(1))] as f32;
+        out.push((s0 + (s1 - s0) * frac) as i16);
+    }
+    out
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VoicePublishStats {
+    next_seq: u64,
+    frames_published: u64,
+}
+
+fn publish_tts_audio_response_with_relay(
+    session: &CallSessionParams,
+    relay: InMemoryRelay,
+    local_pubkey_hex: &str,
+    start_seq: u64,
+    tts_text: &str,
+) -> anyhow::Result<VoicePublishStats> {
+    let tts_pcm = synthesize_tts_pcm(tts_text).context("synthesize call tts")?;
+    publish_pcm_audio_response_with_relay(session, relay, local_pubkey_hex, start_seq, tts_pcm)
+}
+
+fn publish_pcm_audio_response_with_relay(
+    session: &CallSessionParams,
+    relay: InMemoryRelay,
+    local_pubkey_hex: &str,
+    start_seq: u64,
+    tts_pcm: crate::call_tts::TtsPcm,
+) -> anyhow::Result<VoicePublishStats> {
+    let Some(track) = call_audio_track_spec(session) else {
+        return Err(anyhow!("call session missing opus audio track"));
+    };
+    if track.channels != 1 {
+        return Err(anyhow!(
+            "tts publish only supports mono track for now (got channels={})",
+            track.channels
+        ));
+    }
+
+    let mut media = MediaSession::with_relay(
+        SessionConfig {
+            moq_url: session.moq_url.clone(),
+            relay_auth: session.relay_auth.clone(),
+        },
+        relay,
+    );
+    media.connect().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let publish_track = TrackAddress {
+        broadcast_path: broadcast_path(&session.broadcast_base, local_pubkey_hex)
+            .map_err(|e| anyhow!("invalid local broadcast path: {e}"))?,
+        track_name: track.name.clone(),
+    };
+
+    let mono_pcm = downmix_to_mono(&tts_pcm.pcm_i16, tts_pcm.channels);
+    let pcm = resample_mono_linear(&mono_pcm, tts_pcm.sample_rate_hz, track.sample_rate);
+    if pcm.is_empty() {
+        return Err(anyhow!("tts synthesis produced no pcm samples"));
+    }
+
+    let frame_samples = ((track.sample_rate as usize) * (track.frame_ms as usize) / 1000)
+        .saturating_mul(track.channels as usize);
+    if frame_samples == 0 {
+        return Err(anyhow!("invalid frame size from track spec"));
+    }
+
+    let codec = OpusCodec;
+    let mut seq = start_seq;
+    let mut frames = 0u64;
+    for chunk in pcm.chunks(frame_samples) {
+        let mut frame_pcm = Vec::with_capacity(frame_samples);
+        frame_pcm.extend_from_slice(chunk);
+        if frame_pcm.len() < frame_samples {
+            frame_pcm.resize(frame_samples, 0);
+        }
+        let packet = codec.encode_pcm_i16(&frame_pcm);
+        let frame = MediaFrame {
+            seq,
+            timestamp_us: seq.saturating_mul((track.frame_ms as u64) * 1_000),
+            keyframe: true,
+            payload: packet.0,
+        };
+        media
+            .publish(&publish_track, frame)
+            .context("publish tts frame")?;
+        seq = seq.saturating_add(1);
+        frames = frames.saturating_add(1);
+    }
+
+    Ok(VoicePublishStats {
+        next_seq: seq,
+        frames_published: frames,
+    })
+}
+
+fn publish_tts_audio_response_with_transport(
+    session: &CallSessionParams,
+    transport: CallMediaTransport,
+    local_pubkey_hex: &str,
+    start_seq: u64,
+    tts_text: &str,
+) -> anyhow::Result<VoicePublishStats> {
+    let tts_pcm = synthesize_tts_pcm(tts_text).context("synthesize call tts")?;
+
+    let Some(track) = call_audio_track_spec(session) else {
+        return Err(anyhow!("call session missing opus audio track"));
+    };
+    if track.channels != 1 {
+        return Err(anyhow!("tts publish only supports mono (got channels={})", track.channels));
+    }
+
+    let publish_track = TrackAddress {
+        broadcast_path: broadcast_path(&session.broadcast_base, local_pubkey_hex)
+            .map_err(|e| anyhow!("invalid local broadcast path: {e}"))?,
+        track_name: track.name.clone(),
+    };
+
+    let mono_pcm = downmix_to_mono(&tts_pcm.pcm_i16, tts_pcm.channels);
+    let pcm = resample_mono_linear(&mono_pcm, tts_pcm.sample_rate_hz, track.sample_rate);
+    if pcm.is_empty() {
+        return Err(anyhow!("tts synthesis produced no pcm samples"));
+    }
+
+    let frame_samples = ((track.sample_rate as usize) * (track.frame_ms as usize) / 1000)
+        .saturating_mul(track.channels as usize);
+    if frame_samples == 0 {
+        return Err(anyhow!("invalid frame size from track spec"));
+    }
+
+    let codec = OpusCodec;
+    let mut seq = start_seq;
+    let mut frames = 0u64;
+    for chunk in pcm.chunks(frame_samples) {
+        let mut frame_pcm = Vec::with_capacity(frame_samples);
+        frame_pcm.extend_from_slice(chunk);
+        if frame_pcm.len() < frame_samples {
+            frame_pcm.resize(frame_samples, 0);
+        }
+        let packet = codec.encode_pcm_i16(&frame_pcm);
+        let frame = MediaFrame {
+            seq,
+            timestamp_us: seq.saturating_mul((track.frame_ms as u64) * 1_000),
+            keyframe: true,
+            payload: packet.0,
+        };
+        transport.publish(&publish_track, frame).context("publish tts frame")?;
+        seq = seq.saturating_add(1);
+        frames = frames.saturating_add(1);
+    }
+
+    Ok(VoicePublishStats { next_seq: seq, frames_published: frames })
+}
+
+fn publish_tts_audio_response(
+    session: &CallSessionParams,
+    local_pubkey_hex: &str,
+    start_seq: u64,
+    tts_text: &str,
+) -> anyhow::Result<VoicePublishStats> {
+    if is_real_moq_url(&session.moq_url) {
+        let transport = CallMediaTransport::for_session(session)?;
+        publish_tts_audio_response_with_transport(session, transport, local_pubkey_hex, start_seq, tts_text)
+    } else {
+        let relay = shared_call_relay(session);
+        publish_tts_audio_response_with_relay(session, relay, local_pubkey_hex, start_seq, tts_text)
+    }
+}
+
 fn start_stt_worker(
     call_id: &str,
     session: &CallSessionParams,
@@ -450,15 +717,20 @@ fn start_stt_worker(
     out_tx: mpsc::UnboundedSender<OutMsg>,
     call_evt_tx: mpsc::UnboundedSender<CallWorkerEvent>,
 ) -> anyhow::Result<EchoWorker> {
-    let relay = shared_call_relay(session);
-    start_stt_worker_with_relay(
-        call_id,
-        session,
-        relay,
-        peer_pubkey_hex,
-        out_tx,
-        call_evt_tx,
-    )
+    if is_real_moq_url(&session.moq_url) {
+        let transport = CallMediaTransport::for_session(session)?;
+        start_stt_worker_with_transport(call_id, session, transport, peer_pubkey_hex, out_tx, call_evt_tx)
+    } else {
+        let relay = shared_call_relay(session);
+        start_stt_worker_with_relay(
+            call_id,
+            session,
+            relay,
+            peer_pubkey_hex,
+            out_tx,
+            call_evt_tx,
+        )
+    }
 }
 
 fn start_stt_worker_with_relay(
@@ -476,10 +748,11 @@ fn start_stt_worker_with_relay(
     let mut media = MediaSession::with_relay(
         SessionConfig {
             moq_url: session.moq_url.clone(),
+            relay_auth: session.relay_auth.clone(),
         },
         relay,
     );
-    media.connect();
+    media.connect().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let subscribe_track = TrackAddress {
         broadcast_path: broadcast_path(&session.broadcast_base, peer_pubkey_hex)
@@ -552,6 +825,86 @@ fn start_stt_worker_with_relay(
     Ok(EchoWorker { stop, task })
 }
 
+fn start_stt_worker_with_transport(
+    call_id: &str,
+    session: &CallSessionParams,
+    transport: CallMediaTransport,
+    peer_pubkey_hex: &str,
+    out_tx: mpsc::UnboundedSender<OutMsg>,
+    call_evt_tx: mpsc::UnboundedSender<CallWorkerEvent>,
+) -> anyhow::Result<EchoWorker> {
+    let Some(track) = call_audio_track_spec(session) else {
+        return Err(anyhow!("call session missing opus audio track"));
+    };
+
+    let subscribe_track = TrackAddress {
+        broadcast_path: broadcast_path(&session.broadcast_base, peer_pubkey_hex)
+            .map_err(|e| anyhow!("invalid peer broadcast path: {e}"))?,
+        track_name: track.name.clone(),
+    };
+    let rx = transport
+        .subscribe(&subscribe_track)
+        .context("subscribe peer track for stt (network)")?;
+
+    let mut pipeline = OpusToTranscriptPipeline::new(
+        track.sample_rate,
+        track.channels,
+        transcriber_from_env().context("initialize stt transcriber")?,
+    )
+    .context("initialize stt pipeline")?;
+
+    let call_id = call_id.to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_task = stop.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let mut rx_frames = 0u64;
+        let mut ticks = 0u64;
+        while !stop_for_task.load(Ordering::Relaxed) {
+            while let Ok(inbound) = rx.try_recv() {
+                rx_frames = rx_frames.saturating_add(1);
+                match pipeline.ingest_packet(OpusPacket(inbound.payload)) {
+                    Ok(Some(text)) => {
+                        let _ = call_evt_tx.send(CallWorkerEvent::TranscriptFinal {
+                            call_id: call_id.clone(),
+                            text,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!("[marmotd] stt ingest failed call_id={} err={err:#}", call_id);
+                    }
+                }
+            }
+
+            ticks = ticks.saturating_add(1);
+            if ticks.is_multiple_of(5) {
+                let _ = out_tx.send(OutMsg::CallDebug {
+                    call_id: call_id.clone(),
+                    tx_frames: 0,
+                    rx_frames,
+                    rx_dropped: 0,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        match pipeline.flush() {
+            Ok(Some(text)) => {
+                let _ = call_evt_tx.send(CallWorkerEvent::TranscriptFinal {
+                    call_id: call_id.clone(),
+                    text,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!("[marmotd] stt flush failed call_id={} err={err:#}", call_id);
+            }
+        }
+    });
+
+    Ok(EchoWorker { stop, task })
+}
+
 fn start_echo_worker_with_relay(
     call_id: &str,
     session: &CallSessionParams,
@@ -563,10 +916,11 @@ fn start_echo_worker_with_relay(
     let mut media = MediaSession::with_relay(
         SessionConfig {
             moq_url: session.moq_url.clone(),
+            relay_auth: session.relay_auth.clone(),
         },
         relay,
     );
-    media.connect();
+    media.connect().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let publish_track = TrackAddress {
         broadcast_path: broadcast_path(&session.broadcast_base, local_pubkey_hex)
@@ -632,17 +986,19 @@ pub async fn run_audio_echo_smoke(frame_count: u64) -> anyhow::Result<AudioEchoS
     let mut peer = MediaSession::with_relay(
         SessionConfig {
             moq_url: session.moq_url.clone(),
+            relay_auth: session.relay_auth.clone(),
         },
         relay.clone(),
     );
     let mut observer = MediaSession::with_relay(
         SessionConfig {
             moq_url: session.moq_url.clone(),
+            relay_auth: session.relay_auth.clone(),
         },
         relay.clone(),
     );
-    peer.connect();
-    observer.connect();
+    peer.connect().map_err(|e| anyhow::anyhow!("{e}"))?;
+    observer.connect().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let peer_pubkey_hex = "11b9a894813efe60d39f8621ae9dc4c6d26de4732411c1cdf4bb15e88898a19c";
     let bot_pubkey_hex = "2284fc7b932b5dbbdaa2185c76a4e17a2ef928d4a82e29b812986b454b957f8f";
@@ -1199,6 +1555,8 @@ pub async fn daemon_main(
                         active_call = Some(ActiveEchoCall {
                             call_id: invite.call_id.clone(),
                             nostr_group_id: invite.nostr_group_id.clone(),
+                            session: invite.session.clone(),
+                            next_voice_seq: 0,
                             worker,
                         });
                         let _ = out_tx.send(out_ok(request_id, Some(json!({
@@ -1270,6 +1628,48 @@ pub async fn daemon_main(
                             call_id,
                             reason,
                         });
+                    }
+                    InCmd::SendAudioResponse {
+                        request_id,
+                        call_id,
+                        tts_text,
+                    } => {
+                        let Some(current) = active_call.as_mut() else {
+                            let _ = out_tx.send(out_error(request_id, "not_found", "active call not found"));
+                            continue;
+                        };
+                        if current.call_id != call_id {
+                            let _ = out_tx.send(out_error(request_id, "not_found", "active call id mismatch"));
+                            continue;
+                        }
+                        if tts_text.trim().is_empty() {
+                            let _ = out_tx.send(out_error(request_id, "bad_request", "tts_text must not be empty"));
+                            continue;
+                        }
+                        match publish_tts_audio_response(
+                            &current.session,
+                            &pubkey_hex,
+                            current.next_voice_seq,
+                            &tts_text,
+                        ) {
+                            Ok(stats) => {
+                                current.next_voice_seq = stats.next_seq;
+                                let _ = out_tx.send(out_ok(
+                                    request_id,
+                                    Some(json!({
+                                        "call_id": call_id,
+                                        "frames_published": stats.frames_published,
+                                    })),
+                                ));
+                            }
+                            Err(err) => {
+                                let _ = out_tx.send(out_error(
+                                    request_id,
+                                    "runtime_error",
+                                    format!("tts publish failed: {err:#}"),
+                                ));
+                            }
+                        }
                     }
                     InCmd::Shutdown { request_id } => {
                         out_tx.send(out_ok(request_id, None)).ok();
@@ -1543,5 +1943,61 @@ mod tests {
         let stats = run_audio_echo_smoke(10).await.expect("audio echo smoke");
         assert_eq!(stats.sent_frames, 10);
         assert_eq!(stats.echoed_frames, 10);
+    }
+
+    #[test]
+    fn tts_pcm_publish_reaches_subscriber() {
+        let call_id = "550e8400-e29b-41d4-a716-446655440123";
+        let session = default_audio_call_session(call_id);
+        let relay = InMemoryRelay::new();
+        let bot_pubkey_hex = "2284fc7b932b5dbbdaa2185c76a4e17a2ef928d4a82e29b812986b454b957f8f";
+
+        let mut observer = MediaSession::with_relay(
+            SessionConfig {
+                moq_url: session.moq_url.clone(),
+                relay_auth: session.relay_auth.clone(),
+            },
+            relay.clone(),
+        );
+        observer
+            .connect()
+            .expect("observer connect");
+        let bot_track = TrackAddress {
+            broadcast_path: broadcast_path(&session.broadcast_base, bot_pubkey_hex)
+                .expect("bot broadcast path"),
+            track_name: "audio0".to_string(),
+        };
+        let echoed_rx = observer.subscribe(&bot_track).expect("subscribe bot track");
+
+        let frame_samples = 960usize; // 20ms @ 48kHz
+        let total_frames = 5usize;
+        let mut pcm = Vec::with_capacity(frame_samples * total_frames);
+        for i in 0..(frame_samples * total_frames) {
+            pcm.push((i as i16 % 200) - 100);
+        }
+
+        let stats = publish_pcm_audio_response_with_relay(
+            &session,
+            relay,
+            bot_pubkey_hex,
+            0,
+            crate::call_tts::TtsPcm {
+                sample_rate_hz: 48_000,
+                channels: 1,
+                pcm_i16: pcm,
+            },
+        )
+        .expect("publish tts pcm");
+        assert_eq!(stats.frames_published, total_frames as u64);
+
+        let mut echoed_frames = 0u64;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while echoed_frames < stats.frames_published && std::time::Instant::now() < deadline {
+            while echoed_rx.try_recv().is_ok() {
+                echoed_frames = echoed_frames.saturating_add(1);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(echoed_frames, stats.frames_published);
     }
 }
