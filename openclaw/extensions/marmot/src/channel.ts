@@ -564,9 +564,10 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
         requestedCmd: requestedSidecarCmd,
         log: ctx.log,
       });
+      const relayArgs = (relays.length > 0 ? relays : ["ws://127.0.0.1:18080"]).flatMap((r) => ["--relay", r]);
       const sidecarArgs =
         resolveSidecarArgs(resolved.config.sidecarArgs) ??
-        ["daemon", "--relay", relays[0] ?? "ws://127.0.0.1:18080", "--state-dir", baseStateDir];
+        ["daemon", ...relayArgs, "--state-dir", baseStateDir];
 
       ctx.log?.info(
         `[${resolved.accountId}] 🦞 MOLTATHON MARMOT v0.2.0 — starting sidecar cmd=${JSON.stringify(sidecarCmd)} args=${JSON.stringify(sidecarArgs)}`,
