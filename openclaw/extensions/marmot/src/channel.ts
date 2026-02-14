@@ -282,6 +282,9 @@ const GROUP_SYSTEM_PROMPT = [
   "Load GROUP_MEMORY.md for shared context. Never reference MEMORY.md or secrets in groups.",
   'To create a poll, send a pika-prompt code block: ```pika-prompt\n{"title":"Your question?","options":["Option A","Option B","Option C"]}\n```',
   'When users vote, you\'ll see messages like [Voted "Option A"]. Track votes to determine results.',
+  'To send rich HTML content (forms, styled widgets, visualizations), use a pika-html code block: ```pika-html\n<h1>Hello</h1>\n```',
+  "The HTML renders in an inline WebView in the app. You can include CSS styles inline or in a <style> tag.",
+  "To let users send a message back from the HTML, use the JS bridge: window.pika.send(\"message text\").",
 ].join(" ");
 
 async function dispatchInboundToAgent(params: {
