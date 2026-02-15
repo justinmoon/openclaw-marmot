@@ -338,6 +338,17 @@ async function dispatchInboundToAgent(params: {
   const chatType = isGroupChat ? "group" : "dm";
   const senderName = await resolveMemberNameAsync(senderId, cfg);
 
+  // Resolve agent binding — respects bindings config (e.g. channel: "marmot" → agentId)
+  const route = runtime.channel.routing.resolveAgentRoute({
+    cfg,
+    channel: "marmot",
+    accountId,
+    peer: {
+      kind: isGroupChat ? "group" : "direct",
+      id: isGroupChat ? chatId : senderId,
+    },
+  });
+
   // Resolve group members for context (best effort)
   let groupMembersInfo: string | undefined;
   if (isGroupChat && params.stateDir) {
@@ -349,7 +360,7 @@ async function dispatchInboundToAgent(params: {
     }
   }
 
-  const ctx = {
+  const ctx = runtime.channel.reply.finalizeInboundContext({
     Body: text,
     RawBody: text,
     CommandBody: text,
@@ -357,8 +368,8 @@ async function dispatchInboundToAgent(params: {
     BodyForAgent: text,
     From: senderId,
     To: chatId,
-    ...(isGroupChat ? { SessionKey: `marmot:${accountId}:${chatId}` } : {}),
-    AccountId: accountId,
+    SessionKey: route.sessionKey,
+    AccountId: route.accountId,
     Provider: "marmot",
     Surface: "marmot",
     ChatType: chatType,
@@ -374,7 +385,7 @@ async function dispatchInboundToAgent(params: {
       InboundHistory: params.inboundHistory,
       ConversationLabel: params.groupName || chatId,
     } : {}),
-  } as any;
+  });
 
   await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx,
