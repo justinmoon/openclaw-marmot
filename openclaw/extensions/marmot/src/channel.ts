@@ -12,6 +12,7 @@ import {
 } from "./types.js";
 import { MarmotSidecar, resolveAccountStateDir } from "./sidecar.js";
 import { resolveMarmotSidecarCommand } from "./sidecar-install.js";
+import { resolveMarmotChannelConfig, type AvatarConfig } from "./config.js";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
@@ -316,6 +317,41 @@ const GROUP_SYSTEM_PROMPT = [
   'The app calls window.pikaState(body) on the live widget. Use pika-html-update for full HTML replacement, pika-html-state-update for JS state injection.',
 ].join(" ");
 
+function buildAvatarPrompt(avatar: AvatarConfig): string {
+  if (!avatar.enabled) return "";
+
+  const parts: string[] = [
+    "\n\n## Avatar Widget",
+    "You have a 3D avatar. On your FIRST message in any conversation, include a `pika-html avatar` block with a Three.js + VRM scene.",
+  ];
+
+  if (avatar.modelUrl) {
+    parts.push(`Use this VRM model: ${avatar.modelUrl}`);
+  } else {
+    parts.push("Find a publicly accessible VRM model URL (e.g. from VRoid Hub CDN or similar). The URL must be a direct .vrm file link that can be fetched from a WebView.");
+  }
+
+  parts.push(
+    "The HTML must include Three.js (via CDN), @pixiv/three-vrm (via CDN), a <canvas>, and define window.pikaState to receive expression updates.",
+    'window.pikaState receives an object like {"expression":"happy","intensity":0.8}. Map expression names to VRM blend shapes (happy, angry, sad, surprised, relaxed).',
+    "Keep the scene simple: neutral background, camera framed on upper body, basic lighting.",
+  );
+
+  if (avatar.autoSend) {
+    parts.push("ALWAYS include the avatar pika-html block in your very first response to the group. Send it before your text reply.");
+  }
+
+  if (avatar.expressions) {
+    parts.push(
+      "After the avatar is sent, monitor the conversation mood. When the mood shifts, send a pika-html-state-update avatar block with the new expression.",
+      "Available expressions: happy, angry, sad, surprised, relaxed, neutral. Include intensity (0.0-1.0).",
+      "Don't send expression updates on every message — only when there's a clear mood change.",
+    );
+  }
+
+  return parts.join(" ");
+}
+
 async function dispatchInboundToAgent(params: {
   runtime: ReturnType<typeof getMarmotRuntime>;
   accountId: string;
@@ -349,6 +385,9 @@ async function dispatchInboundToAgent(params: {
     }
   }
 
+  const currentCfg = resolveMarmotChannelConfig(cfg?.channels?.marmot);
+  const avatarPrompt = buildAvatarPrompt(currentCfg.avatar);
+
   const ctx = {
     Body: text,
     RawBody: text,
@@ -370,7 +409,7 @@ async function dispatchInboundToAgent(params: {
     WasMentioned: params.wasMentioned ?? !isGroupChat,
     ...(isGroupChat ? {
       GroupSubject: params.groupName || groupNames.get(chatId) || undefined,
-      GroupSystemPrompt: GROUP_SYSTEM_PROMPT + (groupMembersInfo ? `\nGroup members: ${groupMembersInfo}\nTo mention someone, use their nostr:npub1... identifier.` : ""),
+      GroupSystemPrompt: GROUP_SYSTEM_PROMPT + avatarPrompt + (groupMembersInfo ? `\nGroup members: ${groupMembersInfo}\nTo mention someone, use their nostr:npub1... identifier.` : ""),
       InboundHistory: params.inboundHistory,
       ConversationLabel: params.groupName || chatId,
     } : {}),

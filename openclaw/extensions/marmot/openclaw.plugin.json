@@ -61,6 +61,16 @@
         "description": "Pubkeys to ignore messages from (e.g., other bots).",
         "type": "array",
         "items": { "type": "string" }
+      },
+      "avatar": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "modelUrl": { "type": "string", "description": "URL to a .vrm avatar model. If omitted, the LLM will find one." },
+          "autoSend": { "type": "boolean", "default": true, "description": "Auto-send avatar widget with first response." },
+          "expressions": { "type": "boolean", "default": true, "description": "Update avatar expressions based on conversation mood." }
+        }
       }
     },
     "required": []

@@ -5,6 +5,13 @@ export type MarmotGroupConfig = {
   // Future: requireMention, toolPolicy, etc.
 };
 
+export type AvatarConfig = {
+  enabled: boolean;
+  modelUrl?: string;
+  autoSend: boolean;
+  expressions: boolean;
+};
+
 export type MarmotChannelConfig = {
   relays: string[];
   stateDir?: string;
@@ -14,6 +21,7 @@ export type MarmotChannelConfig = {
   groupPolicy: MarmotGroupPolicy;
   groupAllowFrom: string[];
   groups: Record<string, MarmotGroupConfig>;
+  avatar: AvatarConfig;
 };
 
 function asStringArray(value: unknown): string[] | null {
@@ -56,6 +64,14 @@ export function resolveMarmotChannelConfig(raw: unknown): MarmotChannelConfig {
     groups[gid] = name ? { name } : {};
   }
 
+  const avatarRaw = obj.avatar && typeof obj.avatar === "object" ? (obj.avatar as Record<string, unknown>) : {};
+  const avatar: AvatarConfig = {
+    enabled: avatarRaw.enabled === true,
+    modelUrl: typeof avatarRaw.modelUrl === "string" && avatarRaw.modelUrl.trim() ? avatarRaw.modelUrl.trim() : undefined,
+    autoSend: typeof avatarRaw.autoSend === "boolean" ? avatarRaw.autoSend : true,
+    expressions: typeof avatarRaw.expressions === "boolean" ? avatarRaw.expressions : true,
+  };
+
   return {
     relays,
     stateDir,
@@ -65,6 +81,7 @@ export function resolveMarmotChannelConfig(raw: unknown): MarmotChannelConfig {
     groupPolicy,
     groupAllowFrom,
     groups,
+    avatar,
   };
 }
 
