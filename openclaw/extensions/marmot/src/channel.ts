@@ -337,7 +337,7 @@ function buildAvatarPrompt(avatar: AvatarConfig): string {
     "After loading, THREE and THREE.GLTFLoader are globals. three-vrm exposes THREE_VRM (with underscores). Load VRM models with: var loader = new THREE.GLTFLoader(); loader.load(url, function(gltf) { THREE_VRM.VRM.from(gltf).then(function(vrm) { scene.add(vrm.scene); }); });",
     "Include a <canvas>, and define window.pikaState as a function to receive expression updates.",
     'window.pikaState receives an object like {"expression":"happy","intensity":0.8}. Map expression names to VRM blend shapes (happy, angry, sad, surprised, relaxed). Use vrm.blendShapeProxy.setValue(THREE_VRM.VRMSchema.BlendShapePresetName.Joy, intensity) etc.',
-    "Keep the scene simple: neutral background (#1a1a2e), basic lighting. IMPORTANT: After loading the model, compute its bounding box with new THREE.Box3().setFromObject(vrm.scene), get the center and size, then position the camera to frame the full model with padding. Use camera.position.set(0, center.y, size.z * 2.5) and camera.lookAt(center). This ensures any model is framed correctly regardless of its size.",
+    "Keep the scene simple: neutral background (#1a1a2e), basic lighting. IMPORTANT: After loading the model, compute its bounding box with new THREE.Box3().setFromObject(vrm.scene), get the center and size. Frame the upper body: var headY = box.min.y + size.y * 0.85; camera.position.set(0, headY, size.y * 0.9); camera.lookAt(0, headY - size.y * 0.05, 0); This frames the face/upper body for a humanoid avatar.",
   );
 
   if (avatar.autoSend) {
