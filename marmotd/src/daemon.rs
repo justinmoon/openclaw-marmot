@@ -187,16 +187,18 @@ fn event_h_tag_hex(ev: &Event) -> Option<String> {
 }
 
 pub async fn daemon_main(
-    relay: &str,
+    relays_arg: &[String],
     state_dir: &Path,
     giftwrap_lookback_sec: u64,
     allow_pubkeys: &[String],
 ) -> anyhow::Result<()> {
     crate::ensure_dir(state_dir).context("create state dir")?;
 
-    crate::check_relay_ready(relay, Duration::from_secs(90))
+    // Use the first relay for initial connectivity check; all relays are added to the client below.
+    let primary_relay = relays_arg.first().map(|s| s.as_str()).unwrap_or("ws://127.0.0.1:18080");
+    crate::check_relay_ready(primary_relay, Duration::from_secs(90))
         .await
-        .with_context(|| format!("relay readiness check failed for {relay}"))?;
+        .with_context(|| format!("relay readiness check failed for {primary_relay}"))?;
 
     let keys = crate::load_or_create_keys(&state_dir.join("identity.json"))?;
     let pubkey_hex = keys.public_key().to_hex().to_lowercase();
@@ -241,8 +243,19 @@ pub async fn daemon_main(
         })
         .ok();
 
-    let mut relay_urls = vec![RelayUrl::parse(relay).context("parse relay url")?];
-    let client = crate::connect_client(&keys, relay).await?;
+    let mut relay_urls: Vec<RelayUrl> = Vec::new();
+    for r in relays_arg {
+        relay_urls.push(RelayUrl::parse(r.trim()).with_context(|| format!("parse relay url: {r}"))?);
+    }
+    if relay_urls.is_empty() {
+        relay_urls.push(RelayUrl::parse("ws://127.0.0.1:18080").context("parse default relay url")?);
+    }
+    // Connect to the primary relay first, then add the rest.
+    let client = crate::connect_client(&keys, primary_relay).await?;
+    for r in relay_urls.iter().skip(1) {
+        let _ = client.add_relay(r.clone()).await;
+    }
+    client.connect().await;
     let mdk = crate::new_mdk(state_dir, "daemon")?;
 
     let mut rx = client.notifications();
@@ -310,7 +323,7 @@ pub async fn daemon_main(
                 let Some(cmd) = cmd else { break; };
                 match cmd {
                     InCmd::PublishKeypackage { request_id, relays } => {
-                        let selected = match parse_relay_list(relay, &relays) {
+                        let selected = match parse_relay_list(primary_relay, &relays) {
                             Ok(v) => v,
                             Err(e) => {
                                 out_tx.send(out_error(request_id, "bad_relays", e.to_string())).ok();
@@ -362,7 +375,7 @@ pub async fn daemon_main(
                         };
                     }
                     InCmd::SetRelays { request_id, relays } => {
-                        match parse_relay_list(relay, &relays) {
+                        match parse_relay_list(primary_relay, &relays) {
                             Ok(v) => {
                                 relay_urls = v.clone();
                                 for r in v.iter() {
