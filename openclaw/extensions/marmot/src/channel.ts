@@ -332,7 +332,9 @@ function buildAvatarPrompt(avatar: AvatarConfig): string {
   }
 
   parts.push(
-    "The HTML must include Three.js (via CDN), @pixiv/three-vrm (via CDN), a <canvas>, and define window.pikaState to receive expression updates.",
+    "CRITICAL: The HTML renders in a mobile WebView that does NOT support ES modules or import maps. You MUST use classic <script src=\"...\"> tags, NOT <script type=\"module\"> or <script type=\"importmap\">.",
+    "Use these CDN URLs with classic script tags: three.js from https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js (exposes window.THREE), GLTFLoader from https://cdn.jsdelivr.net/npm/three@0.158.0/examples/js/loaders/GLTFLoader.js, and @pixiv/three-vrm from https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@2.1.0/lib/three-vrm.min.js (exposes window.THREEVRM).",
+    "Include a <canvas>, and define window.pikaState as a function to receive expression updates.",
     'window.pikaState receives an object like {"expression":"happy","intensity":0.8}. Map expression names to VRM blend shapes (happy, angry, sad, surprised, relaxed).',
     "Keep the scene simple: neutral background, camera framed on upper body, basic lighting.",
   );
