@@ -333,9 +333,10 @@ function buildAvatarPrompt(avatar: AvatarConfig): string {
 
   parts.push(
     "CRITICAL: The HTML renders in a mobile WebView that does NOT support ES modules or import maps. You MUST use classic <script src=\"...\"> tags, NOT <script type=\"module\"> or <script type=\"importmap\">.",
-    "Use these CDN URLs with classic script tags: three.js from https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js (exposes window.THREE), GLTFLoader from https://cdn.jsdelivr.net/npm/three@0.158.0/examples/js/loaders/GLTFLoader.js, and @pixiv/three-vrm from https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@2.1.0/lib/three-vrm.min.js (exposes window.THREEVRM).",
+    "Use EXACTLY these CDN URLs (other versions will 404): <script src=\"https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js\"></script> <script src=\"https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js\"></script> <script src=\"https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@0.6.11/lib/three-vrm.min.js\"></script>",
+    "After loading, THREE and THREE.GLTFLoader are globals. three-vrm exposes THREEVRM. Load VRM models with: var loader = new THREE.GLTFLoader(); loader.load(url, function(gltf) { THREEVRM.VRM.from(gltf).then(function(vrm) { scene.add(vrm.scene); }); });",
     "Include a <canvas>, and define window.pikaState as a function to receive expression updates.",
-    'window.pikaState receives an object like {"expression":"happy","intensity":0.8}. Map expression names to VRM blend shapes (happy, angry, sad, surprised, relaxed).',
+    'window.pikaState receives an object like {"expression":"happy","intensity":0.8}. Map expression names to VRM blend shapes (happy, angry, sad, surprised, relaxed). Use vrm.blendShapeProxy.setValue(THREEVRM.VRMSchema.BlendShapePresetName.Joy, intensity) etc.',
     "Keep the scene simple: neutral background, camera framed on upper body, basic lighting.",
   );
 
