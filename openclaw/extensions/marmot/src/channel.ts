@@ -311,6 +311,9 @@ const GROUP_SYSTEM_PROMPT = [
   'Always include an ID after pika-html (e.g. "dashboard", "search-results"). To update it later, send: ```pika-html-update my-widget\n<h1>Updated</h1>\n``` The update replaces the original inline.',
   "The HTML renders in an inline WebView in the app. You can include CSS styles inline or in a <style> tag.",
   "To let users send a message back from the HTML, use the JS bridge: window.pika.send(\"message text\").",
+  'For stateful widgets (3D avatars, dashboards), define window.pikaState in your HTML.',
+  'To update state without reloading, send: ```pika-html-state-update my-widget\n{"key":"value"}\n```',
+  'The app calls window.pikaState(body) on the live widget. Use pika-html-update for full HTML replacement, pika-html-state-update for JS state injection.',
 ].join(" ");
 
 async function dispatchInboundToAgent(params: {
