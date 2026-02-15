@@ -236,6 +236,31 @@ function isDmGroup(chatId: string, cfg: any): boolean {
 }
 
 /**
+ * Check if a group is a 1:1 conversation (2 or fewer members).
+ * Uses the MLS group membership via sqlite, with a fallback to the group name
+ * from the welcome event (Pika names DM groups "DM").
+ * Returns false on any error (fail-open: treat as multi-person group).
+ */
+function isOneOnOneGroup(nostrGroupId: string, stateDir: string): boolean {
+  // Check in-memory cache first
+  const cachedName = groupNames.get(nostrGroupId.toLowerCase());
+  if (cachedName?.toLowerCase() === "dm") return true;
+
+  // Query the MLS groups table for the group name (persists across restarts)
+  try {
+    const { execSync } = require("node:child_process");
+    const dbPath = path.join(stateDir, "mdk.sqlite");
+    const query = `SELECT name FROM groups WHERE nostr_group_id = x'${nostrGroupId}';`;
+    const result = execSync(`sqlite3 "${dbPath}" "${query}"`, { encoding: "utf-8", timeout: 3000 }).trim();
+    if (result.toLowerCase() === "dm") return true;
+  } catch {
+    // fall through
+  }
+
+  return false;
+}
+
+/**
  * Query the marmot sqlite DB for distinct member pubkeys in a group.
  * Returns an array of { pubkey, npub, name } for each member.
  */
@@ -699,7 +724,14 @@ export const marmotPlugin: ChannelPlugin<ResolvedMarmotAccount> = {
 
             if (isGroupChat) {
               // GROUP CHAT FLOW — mention gating + history buffering
-              const requireMention = resolveRequireMention(groupId, currentCfg);
+              // Skip mention gating for 1:1 groups (2 members) — they should always trigger
+              const oneOnOne = isOneOnOneGroup(groupId, baseStateDir);
+              if (oneOnOne) {
+                ctx.log?.debug(
+                  `[${resolved.accountId}] 1:1 group detected, skipping mention gating group=${ev.nostr_group_id} from=${senderPk}`,
+                );
+              }
+              const requireMention = oneOnOne ? false : resolveRequireMention(groupId, currentCfg);
               const wasMentioned = handle ? detectMention(ev.content, handle.pubkey, handle.npub, currentCfg) : false;
               const senderName = await resolveMemberNameAsync(senderPk, currentCfg);
 
