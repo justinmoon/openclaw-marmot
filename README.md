@@ -1,3 +1,9 @@
+# ⚠️ DEPRECATED
+
+**This repository has been archived. The code has moved to [https://github.com/sledtools/pika](https://github.com/sledtools/pika).**
+
+---
+
 # marmot-interop-lab-rust
 
 > [!WARNING]
